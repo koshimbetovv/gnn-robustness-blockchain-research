@@ -1,0 +1,17 @@
+# Core DL + Graph learning
+# NOTE: torch-geometric may require platform-specific wheels (torch-scatter/torch-sparse/torch-cluster/torch-spline-conv).
+# If installation fails, follow the official PyG install instructions for your PyTorch + CUDA/MPS setup.
+
+torch
+torch-geometric
+torch-geometric-temporal
+numpy
+pandas
+scikit-learn
+scipy
+tqdm
+pyyaml
+networkx
+matplotlib
+xgboost
+PyWavelets

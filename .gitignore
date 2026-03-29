@@ -1,0 +1,12 @@
+__pycache__/
+*.pt
+*.log
+.ipynb_checkpoints/
+.venv/
+.DS_Store
+results/
+__MACOSX/
+data/
+experiments/
+attacks/
+/models/

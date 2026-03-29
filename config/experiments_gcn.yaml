@@ -1,0 +1,71 @@
+global:
+  split: test
+  attack_only_illicit: true
+  only_clean_correct: true
+  attack_fraction: 1.0
+  seeds:
+  - 0
+  - 1
+  models:
+  - gcn
+sweeps:
+- attack: fgsm
+  params:
+    EPS:
+    - 0.01
+    - 0.03
+    - 0.05
+    - 0.1
+- attack: pgd
+  params:
+    EPS:
+    - 0.03
+    - 0.05
+    - 0.1
+    STEPS:
+    - 10
+    - 30
+    ALPHA:
+    - auto
+    RANDOM_START:
+    - true
+- attack: node_injection
+  params:
+    N_INJECT:
+    - 1
+    - 3
+    - 5
+    EDGES_PER_INJECTED:
+    - 1
+    - 5
+    - 10
+    EPS:
+    - 0.03
+    - 0.05
+    STEPS:
+    - 30
+- attack: monti
+  params:
+    N_INJECT:
+    - 5
+    - 10
+    EDGE_BUDGET:
+    - 20
+    - 50
+    - 100
+    K_HOP:
+    - 2
+    EPS:
+    - 0.05
+- attack: nettack
+  params:
+    N_PERTURBATIONS:
+    - 2
+    - 5
+    SAMPLE_SIZE:
+    - 50
+    - 200
+    ATTACK_INCOMING:
+    - true
+    EARLY_STOP:
+    - true
