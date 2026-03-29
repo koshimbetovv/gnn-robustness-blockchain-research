@@ -20,7 +20,7 @@ def get_device(allow_cuda: bool = True, allow_mps: bool = True) -> torch.device:
 def split_mask(data, split: str):
     attr = f"{split}_mask"
     if not hasattr(data, attr):
-        raise ValueError(f"Missing {attr} in data. Re-run preprocessing and ensure dataset loads masks.")
+        raise ValueError(f"Missing {attr} in data. Ensure the dataset loader creates masks correctly from the raw files.")
     return getattr(data, attr).bool() & (data.y != -1)
 
 
@@ -41,8 +41,7 @@ def get_time_step_or_raise(data, model_name: str):
     temporal_models = {"chronowave_gnn", "recgnn"}
     if model_name in temporal_models:
         raise ValueError(
-            f"{model_name} requires data.time_step, but your processed Elliptic data does not include it. "
-            f"Re-run scripts/preprocess_elliptic.py first."
+            f"{model_name} requires data.time_step, but the loaded dataset does not include it."
         )
     return None
 
@@ -72,7 +71,7 @@ def train_standard_model(model, data, config: dict, model_name: str, title: str)
     train_mask = split_mask(data, "train")
     y_train = data.y[train_mask]
     if y_train.numel() == 0:
-        raise ValueError("Train split has 0 labeled nodes (y!=-1). Check preprocessing/masks.")
+        raise ValueError("Train split has 0 labeled nodes (y!=-1). Check dataset masks / label mapping.")
 
     use_class_weights = config["training"].get("use_class_weights", True)
     class_weights = safe_class_weights(y_train, device) if use_class_weights else None

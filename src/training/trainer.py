@@ -54,7 +54,7 @@ class Trainer:
             mask = train_mask & (self.data.y != -1)
 
             if mask.sum().item() == 0:
-                raise ValueError("No labeled nodes found (all y == -1). Check preprocessing / label mapping.")
+                raise ValueError("No labeled nodes found (all y == -1). Check dataset loading / label mapping.")
 
             out = self.model(self.data.x, self.data.edge_index)
             loss = F.cross_entropy(out[mask], self.data.y[mask], weight=self.class_weights)

@@ -26,7 +26,7 @@ CONFIG = {
         "train_end": 34,
         "test_start": 35,
         "test_end": 49,
-        "filter_unknown": True,
+        "filter_unknown": False,
     },
     "model": {
         "hidden_dim": 50,
@@ -34,10 +34,11 @@ CONFIG = {
         "out_dim": 2,
     },
     "training": {
-        "epochs": 100,
+        "epochs": 50,
         "lr": 1.5e-3,
         "weight_decay": 0.0,
         "log_every": 10,
+        "use_class_weights": False,
     },
     "save": {
         "save_dir": "models",

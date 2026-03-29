@@ -52,26 +52,16 @@ data/raw/elliptic/
   elliptic_txs_edgelist.csv
 ```
 
-Then run preprocessing:
-
-```bash
-python scripts/preprocess_elliptic.py
-```
-
-This creates:
-
-```
-data/processed/elliptic/data.pt
-```
+The training and attack scripts now load Elliptic **directly from the raw CSVs** via `src/datasets/elliptic.py`; no separate preprocessing step is required.
 
 **Label convention** used throughout the project:
 - `y = 0` → legitimate
 - `y = 1` → fraudulent/illicit
 - `y = -1` → unlabeled (ignored by masks)
 
-**Time split** used in `preprocess_elliptic.py`:
-- train: timesteps 1–41
-- test: timesteps 42–49
+**Time split** used by the Elliptic loader:
+- train: timesteps 1–34
+- test: timesteps 35–49
 
 Features are standardized using a `StandardScaler` fit on **train only**, then applied to all nodes.
 
@@ -115,7 +105,7 @@ Key points:
 - Choose a **labeled** target node (`y != -1`).
 - The attack, as implemented, **adds edges only** (no deletions).
 
-If you want to run the demo, make sure your `data.pt` exists, then run:
+If you want to run the demo, make sure the Elliptic raw CSVs exist under `data/raw/elliptic/`, then run:
 
 ```bash
 python -m src.main
@@ -152,6 +142,5 @@ Useful scripts under `tools/`:
 
 ## Known gaps / TODOs
 - Most attacks (FGSM/PGD/random injections) are currently placeholders.
-- `src/training/metrics.py`, `src/utils/seed.py`, and `src/utils/logging.py` are present but empty.
 - There is no unified “experiment runner” yet (training is script-based).
 

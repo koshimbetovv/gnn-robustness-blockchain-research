@@ -19,6 +19,7 @@ class RecGNNEllipticConfig:
     train_end: int = 34
     test_start: int = 35
     test_end: int = 49
+    filter_unknown: bool = False
 
 
 @dataclass
@@ -72,8 +73,19 @@ class RecGNNEllipticDataset:
         y_map = dict(zip(classes["txId"].astype(str), classes["y"].astype(int)))
         y_all = np.asarray([y_map.get(tx_id, -1) for tx_id in tx_ids], dtype=np.int64)
 
+        if cfg.filter_unknown:
+            keep = y_all != -1
+            if keep.sum() == 0:
+                raise ValueError("No nodes remain after filtering unknown labels in RecGNN Elliptic loader.")
+            tx_ids = [tx for tx, k in zip(tx_ids, keep) if k]
+            time_step = time_step[keep]
+            local_x = local_x[keep]
+            y_all = y_all[keep]
+
         # Standardize local features using TRAIN nodes only.
         train_mask_np = (time_step >= cfg.train_start) & (time_step <= cfg.train_end)
+        if train_mask_np.sum() == 0:
+            raise ValueError("RecGNN Elliptic train split is empty after filtering. Check split bounds.")
         scaler = StandardScaler()
         scaler.fit(local_x[train_mask_np])
         local_x = scaler.transform(local_x).astype(np.float32)

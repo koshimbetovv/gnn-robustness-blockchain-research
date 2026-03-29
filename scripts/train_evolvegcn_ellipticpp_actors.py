@@ -34,7 +34,7 @@ BASE_CONFIGS = {
             "train_end": 34,
             "test_start": 35,
             "test_end": 49,
-            "filter_unknown": True,
+            "filter_unknown": False,
         },
         "model": {
             "variant": "h",

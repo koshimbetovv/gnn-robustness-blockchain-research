@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.datasets.elliptic import EllipticDataset
+from src.datasets.elliptic import EllipticConfig, EllipticDataset
 from src.models.chronowave_gnn import ChronoWaveGNN
 from src.utils.seed import seed_from_config
 from scripts.train_paper_utils import (
@@ -23,6 +23,16 @@ from scripts.train_paper_utils import (
 
 CONFIG = {
     "seed": 42,
+    "data": {
+        "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
+        "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
+        "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
+        "train_start": 1,
+        "train_end": 34,
+        "test_start": 35,
+        "test_end": 49,
+        "filter_unknown": True,
+    },
     "model": {
         "hidden_dim": 256,   # paper leaves hidden dimension unspecified
         "time_dim": 8,
@@ -38,6 +48,7 @@ CONFIG = {
         "label_smoothing": 0.1,
         "grad_clip": 1.0,
         "log_every": 20,
+        "use_class_weights": False,
     },
     "save": {
         "save_dir": "models",
@@ -86,7 +97,7 @@ def main():
     seed_from_config(CONFIG)
     device = get_device()
 
-    data = EllipticDataset().get_data()
+    data = EllipticDataset(EllipticConfig(**CONFIG["data"])).get_data()
     build_paper_features(data)
     data = data.to(device)
     data.x = data.x.float()
@@ -117,7 +128,7 @@ def main():
     )
 
     print("Class weights: None (paper does not specify weighted CE)")
-    print("\n=== Training ChronoWave-GNN (train/test only, unknown labels filtered in preprocessing) ===")
+    print("\n=== Training ChronoWave-GNN (train/test only, unknown labels filtered by the dataset loader) ===")
 
     log_every = CONFIG["training"]["log_every"]
     for epoch in range(1, CONFIG["training"]["epochs"] + 1):

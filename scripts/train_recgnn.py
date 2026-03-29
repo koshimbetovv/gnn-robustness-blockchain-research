@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from scripts.train_paper_utils import get_device
 from scripts.train_recgnn_utils import evaluate_recgnn_sequence, train_recgnn_epoch
-from src.datasets.recgnn_elliptic import RecGNNEllipticDataset
+from src.datasets.recgnn_elliptic import RecGNNEllipticConfig, RecGNNEllipticDataset
 from src.models.recgnn import RecGNN
 from src.utils.logging import print_epoch_metrics, print_final_metrics, save_run
 from src.utils.seed import seed_from_config
@@ -23,6 +23,7 @@ CONFIG = {
         "train_end": 34,
         "test_start": 35,
         "test_end": 49,
+        "filter_unknown": False,
     },
     "model": {
         "hidden_dim": 50,
@@ -34,6 +35,7 @@ CONFIG = {
         "lr": 1.5e-3,
         "weight_decay": 0.0,
         "log_every": 10,
+        "use_class_weights": False,
     },
     "save": {
         "save_dir": "models",
@@ -47,7 +49,7 @@ def main():
     seed_from_config(CONFIG)
     device = get_device()
 
-    dataset = RecGNNEllipticDataset()
+    dataset = RecGNNEllipticDataset(RecGNNEllipticConfig(**CONFIG["data"]))
     sequence = dataset.get_sequence()
     CONFIG["model"]["state_rows"] = int(sequence.max_nodes)
 

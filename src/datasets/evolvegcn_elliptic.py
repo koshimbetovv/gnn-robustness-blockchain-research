@@ -18,6 +18,7 @@ class EvolveGCNEllipticConfig:
     train_end: int = 34
     test_start: int = 35
     test_end: int = 49
+    filter_unknown: bool = False
 
 
 @dataclass
@@ -117,6 +118,20 @@ class EvolveGCNEllipticDataset:
             tx = str(row["txId"])
             if tx in tx_to_idx:
                 labels_by_idx[tx_to_idx[tx]] = int(row["y"])
+
+        if cfg.filter_unknown:
+            keep = labels_by_idx >= 0
+            if int(keep.sum().item()) == 0:
+                raise ValueError("No nodes remain after filtering unknown labels in EvolveGCN Elliptic loader.")
+
+            keep_np = keep.cpu().numpy().astype(bool)
+            tx_ids = [tx for tx, k in zip(tx_ids, keep_np) if k]
+            raw_time = raw_time[keep_np]
+            node_features = node_features[keep]
+            labels_by_idx = labels_by_idx[keep]
+
+            tx_to_idx = {tx_id: i for i, tx_id in enumerate(tx_ids)}
+            num_nodes = len(tx_ids)
 
         nodes_labels_times = []
         for idx in range(num_nodes):

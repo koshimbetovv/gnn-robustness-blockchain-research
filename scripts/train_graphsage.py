@@ -4,13 +4,23 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from scripts.train_paper_utils import get_device, train_standard_model
-from src.datasets.elliptic import EllipticDataset
+from src.datasets.elliptic import EllipticConfig, EllipticDataset
 from src.models.graphsage import GraphSAGE
 from src.utils.seed import seed_from_config
 
 
 CONFIG = {
     "seed": 42,
+    "data": {
+        "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
+        "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
+        "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
+        "train_start": 1,
+        "train_end": 34,
+        "test_start": 35,
+        "test_end": 49,
+        "filter_unknown": True,
+    },
     "model": {
         "hidden_dim": 128,
         "aggr": "mean",
@@ -38,7 +48,7 @@ def main():
     seed_from_config(CONFIG)
     device = get_device()
 
-    data = EllipticDataset().get_data().to(device)
+    data = EllipticDataset(EllipticConfig(**CONFIG["data"])).get_data().to(device)
     data.x = data.x.float()
     data.edge_index = data.edge_index.long()
 

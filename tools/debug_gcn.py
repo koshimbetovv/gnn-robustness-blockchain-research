@@ -98,7 +98,7 @@ report("edge_index(float)", data.edge_index.float())
 mask = get_train_mask(data)
 print(f"\nUsing train mask. #train labeled = {int(mask.sum().item())}")
 if mask.sum().item() == 0:
-    raise ValueError("Train mask has 0 labeled nodes. Check preprocessing/masks/y mapping.")
+    raise ValueError("Train mask has 0 labeled nodes. Check dataset masks / label mapping.")
 
 # Create model
 model = GCN(data.num_features, 64, 2, num_layers=2, dropout=0.4, use_norm=True).to(device)
