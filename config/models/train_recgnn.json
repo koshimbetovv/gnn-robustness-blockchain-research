@@ -1,0 +1,30 @@
+{
+  "seed": 42,
+  "data": {
+    "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
+    "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
+    "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
+    "train_start": 1,
+    "train_end": 34,
+    "test_start": 35,
+    "test_end": 49,
+    "filter_unknown": false
+  },
+  "model": {
+    "hidden_dim": 50,
+    "dropout": 0.5,
+    "out_dim": 2
+  },
+  "training": {
+    "epochs": 50,
+    "lr": 0.0015,
+    "weight_decay": 0.0,
+    "log_every": 10,
+    "use_class_weights": false
+  },
+  "save": {
+    "save_dir": "models",
+    "save_run": true,
+    "prefix": "recgnn"
+  }
+}

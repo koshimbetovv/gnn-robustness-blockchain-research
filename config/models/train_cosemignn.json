@@ -1,0 +1,36 @@
+{
+  "seed": 42,
+  "data": {
+    "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
+    "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
+    "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
+    "semi_cache_dir": "data/processed/cosemignn/elliptic/semi_supervised_results",
+    "rebuild_semi": false
+  },
+  "time": {
+    "train_end": 35,
+    "predict_start": 35,
+    "predict_end": 50
+  },
+  "cmos": {
+    "load_pretrain": false,
+    "pretrained_path": "models/cmos_exact.pth",
+    "learning_rate": 0.0001,
+    "epochs": 200
+  },
+  "cosemignn": {
+    "load_pretrain": false,
+    "pretrained_path": "models/cosemignn_exact.pth",
+    "learning_rate": 0.0001,
+    "epochs": 500,
+    "alpha": 0.6,
+    "dim": 128,
+    "dim2": 256,
+    "dim3": 128,
+    "num_heads": 4
+  },
+  "save": {
+    "save_dir": "models",
+    "save_run": true
+  }
+}

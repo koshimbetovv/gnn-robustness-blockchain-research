@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 
 import torch
@@ -6,12 +7,12 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.datasets.elliptic import EllipticConfig, EllipticDataset
 from src.models.chronowave_gnn import ChronoWaveGNN
 from src.utils.seed import seed_from_config
-from scripts.train_paper_utils import (
+from scripts.training.train_paper_utils import (
     eval_split,
     get_device,
     print_epoch_metrics,
@@ -21,41 +22,9 @@ from scripts.train_paper_utils import (
 )
 
 
-CONFIG = {
-    "seed": 42,
-    "data": {
-        "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
-        "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
-        "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
-        "train_start": 1,
-        "train_end": 34,
-        "test_start": 35,
-        "test_end": 49,
-        "filter_unknown": True,
-    },
-    "model": {
-        "hidden_dim": 256,   # paper leaves hidden dimension unspecified
-        "time_dim": 8,
-        "heads": 2,          # paper equations are single-head; head count is not reported
-        "num_layers": 3,
-        "dropout": 0.4,
-        "out_dim": 2,
-    },
-    "training": {
-        "epochs": 300,
-        "lr": 5e-3,
-        "weight_decay": 5e-4,
-        "label_smoothing": 0.1,
-        "grad_clip": 1.0,
-        "log_every": 20,
-        "use_class_weights": False,
-    },
-    "save": {
-        "save_dir": "models",
-        "save_run": True,
-    },
-}
-
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "models", "train_chronowave_gnn.json")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
 def haar_level2_approximation(x: torch.Tensor) -> torch.Tensor:
     try:

@@ -1,10 +1,10 @@
-import copy
+import json
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from scripts.train_evolvegcn_utils import (
+from scripts.training.train_evolvegcn_utils import (
     DualAdam,
     WeightedCrossEntropy,
     build_evolvegcn_model,
@@ -12,7 +12,7 @@ from scripts.train_evolvegcn_utils import (
     move_sample,
     resolve_class_weights,
 )
-from scripts.train_paper_utils import get_device
+from scripts.training.train_paper_utils import get_device
 from src.datasets.evolvegcn_ellipticpp_actors import (
     EvolveGCNActorsConfig,
     EvolveGCNEllipticPPActorsDataset,
@@ -21,78 +21,9 @@ from src.utils.logging import print_eval_epoch_metrics, print_final_metrics, sav
 from src.utils.seed import seed_from_config
 
 
-BASE_CONFIGS = {
-    "h": {
-        "seed": 42,
-        "data": {
-            "feature_path": "data/raw/ellipticpp/actors/wallets_features.csv",
-            "class_path": "data/raw/ellipticpp/actors/wallets_classes.csv",
-            "edge_path": "data/raw/ellipticpp/actors/AddrAddr_edgelist.csv",
-            "num_hist_steps": 5,
-            "adj_mat_time_window": 1,
-            "train_start": 1,
-            "train_end": 34,
-            "test_start": 35,
-            "test_end": 49,
-            "filter_unknown": False,
-        },
-        "model": {
-            "variant": "h",
-            "layer_1_feats": 64,
-            "layer_2_feats": 32,
-            "cls_feats": 64,
-            "skipfeats": False,
-        },
-        "training": {
-            "epochs": 100,
-            "lr": 1e-3,
-            "class_weights": "auto",
-            "log_every": 20,
-            "steps_accum_gradients": 1,
-        },
-        "save": {
-            "save_dir": "models",
-            "save_run": True,
-            "prefix": "evolvegcn_h_ellipticpp_actors",
-        },
-    },
-    "o": {
-        "seed": 42,
-        "data": {
-            "feature_path": "data/raw/ellipticpp/actors/wallets_features.csv",
-            "class_path": "data/raw/ellipticpp/actors/wallets_classes.csv",
-            "edge_path": "data/raw/ellipticpp/actors/AddrAddr_edgelist.csv",
-            "num_hist_steps": 5,
-            "adj_mat_time_window": 1,
-            "train_start": 1,
-            "train_end": 34,
-            "test_start": 35,
-            "test_end": 49,
-            "filter_unknown": True,
-        },
-        "model": {
-            "variant": "o",
-            "layer_1_feats": 64,
-            "layer_2_feats": 32,
-            "cls_feats": 64,
-            "skipfeats": False,
-        },
-        "training": {
-            "epochs": 100,
-            "lr": 1e-3,
-            "class_weights": "auto",
-            "log_every": 20,
-            "steps_accum_gradients": 1,
-        },
-        "save": {
-            "save_dir": "models",
-            "save_run": True,
-            "prefix": "evolvegcn_o_ellipticpp_actors",
-        },
-    },
-}
-
-CONFIG = copy.deepcopy(BASE_CONFIGS["h"])
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "models", "train_evolvegcn_ellipticpp_actors_h.json")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
 
 def main():

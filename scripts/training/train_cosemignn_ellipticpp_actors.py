@@ -8,51 +8,17 @@ from sklearn import metrics
 import numpy as np
 from statistics import mean, pstdev
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.models.cosemignn import CoSemiGNN
 from src.models.cmos import create_cmos_model
 from src.utils.seed import seed_from_config
-from src.datasets.cosemignn_elliptic import load_cosemignn_elliptic
+from src.datasets.cosemignn_ellipticpp_addraddr import load_cosemignn_ellipticpp_addraddr
 
 
-CONFIG = {
-    "seed": 42,
-    "data": {
-        "feature_path": "data/raw/elliptic/elliptic_txs_features.csv",
-        "class_path": "data/raw/elliptic/elliptic_txs_classes.csv",
-        "edge_path": "data/raw/elliptic/elliptic_txs_edgelist.csv",
-        "semi_cache_dir": "data/processed/cosemignn/elliptic/semi_supervised_results",
-        "rebuild_semi": False,
-    },
-    "time": {
-        "train_end": 35,      # train on 1..34
-        "predict_start": 35,  # eval on 35..49
-        "predict_end": 50,
-    },
-    "cmos": {
-        "load_pretrain": False,
-        "pretrained_path": "models/cmos_exact.pth",
-        "learning_rate": 1e-4,
-        "epochs": 200,
-    },
-    "cosemignn": {
-        "load_pretrain": False,
-        "pretrained_path": "models/cosemignn_exact.pth",
-        "learning_rate": 1e-4,
-        "epochs": 500,
-        "alpha": 0.6,
-        "dim": 128,
-        "dim2": 256,
-        "dim3": 128,
-        "num_heads": 4,
-    },
-    "save": {
-        "save_dir": "models",
-        "save_run": True,
-    },
-}
-
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "models", "train_cosemignn_ellipticpp_actors.json")
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
 def get_device():
     if torch.cuda.is_available():
@@ -273,7 +239,7 @@ def main():
     train_time_list = [i for i in range(1, k)]
     predict_time_list = [i for i in range(CONFIG["time"]["predict_start"], CONFIG["time"]["predict_end"])]
 
-    data = load_cosemignn_elliptic(
+    data = load_cosemignn_ellipticpp_addraddr(
         feature_path=CONFIG["data"]["feature_path"],
         class_path=CONFIG["data"]["class_path"],
         edge_path=CONFIG["data"]["edge_path"],
