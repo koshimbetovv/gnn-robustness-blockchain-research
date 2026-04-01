@@ -9,7 +9,8 @@
     "train_start": 1,
     "train_end": 34,
     "test_start": 35,
-    "test_end": 49
+    "test_end": 49,
+    "filter_unknown": false
   },
   "model": {
     "variant": "o",
