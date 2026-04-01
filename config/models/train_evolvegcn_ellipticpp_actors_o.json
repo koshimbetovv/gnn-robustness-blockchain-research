@@ -20,7 +20,7 @@
     "skipfeats": false
   },
   "training": {
-    "epochs": 100,
+    "epochs": 300,
     "lr": 0.001,
     "class_weights": "auto",
     "log_every": 20,
