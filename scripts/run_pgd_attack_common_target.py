@@ -17,10 +17,10 @@ from src.training.metrics import (
     roc_auc_binary, mean_confidence_drop, asr_pos_neg,
     mean_perturbation_l2_on_success,
 )
-from src.utils.attack_targets import pick_target_nodes
+from src.utils.common_targets import compute_clean_correct_illicit_txids
 
 # ---------- attack parameters ----------
-MODEL_NAME = "gat"
+MODEL_NAME = "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -29,7 +29,7 @@ DATASET = "elliptic"
 SPLIT = "test"
 EPS = 0.05
 ALPHA = 0.002
-STEPS = 10
+STEPS = 20
 RANDOM_START = True
 CLAMP = None  # e.g. (-3.0, 3.0)
 
@@ -42,6 +42,19 @@ ATTACK_FRACTION = 1.0
 ONLY_CLEAN_CORRECT = True
 SEED = 0
 
+# Models considered for the common clean-correct illicit intersection. Each
+# model is evaluated on its native test split; the intersection (over tx_ids)
+# defines the shared target pool so every model is attacked on the same nodes.
+COMMON_MODELS = (
+    "gcn",
+    "graphsage",
+    "gat",
+    "chronowave_gnn",
+    "recgnn",
+    "evolvegcn_o",
+    "cosemignn",
+)
+
 def get_device():
     if torch.cuda.is_available(): return torch.device("cuda")
     if torch.backends.mps.is_available(): return torch.device("mps")
@@ -52,13 +65,40 @@ def make_run_dir(model_name: str):
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_pgd_{ts}")
+    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_pgd_common_{ts}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir, ts
 
 def write_json(path: str, obj: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def pick_common_target_nodes(
+    data, common_txids, split_mask, *, fraction: float, seed: int, device,
+) -> torch.Tensor:
+    """Map the common tx_id set into static-graph indices, restricted to split."""
+    if not (0.0 < float(fraction) <= 1.0):
+        raise ValueError(f"ATTACK_FRACTION must be in (0, 1], got {fraction}")
+    txid_to_idx = {tx: i for i, tx in enumerate(data.node_id)}
+    sel = []
+    for tx in common_txids:
+        i = txid_to_idx.get(tx)
+        if i is not None:
+            sel.append(i)
+    if not sel:
+        return torch.empty(0, dtype=torch.long, device=device)
+    idx = torch.tensor(sel, dtype=torch.long, device=split_mask.device)
+    keep = split_mask[idx] & (data.y[idx] != -1)
+    idx = idx[keep]
+    if idx.numel() == 0:
+        return idx.to(device)
+    n = max(1, min(int(round(float(fraction) * float(idx.numel()))), int(idx.numel())))
+    g = torch.Generator(device="cpu"); g.manual_seed(int(seed))
+    idx_cpu = idx.detach().cpu()
+    perm = torch.randperm(idx_cpu.numel(), generator=g)
+    return idx_cpu[perm[:n]].to(device)
+
 
 def main():
     if MODEL_NAME not in STATIC_MODELS:
@@ -69,6 +109,31 @@ def main():
         )
 
     device = get_device()
+
+    # ---- Step 1: per-model clean-correct illicit tx_id sets, then intersect ----
+    print(f"Computing clean-correct illicit tx_ids across {len(COMMON_MODELS)} models ...")
+    per_model_sets: dict[str, set[str]] = {}
+    skipped: dict[str, str] = {}
+    for name in COMMON_MODELS:
+        try:
+            txids = compute_clean_correct_illicit_txids(name, MODEL_DIR, device)
+            per_model_sets[name] = txids
+            print(f"  {name}: {len(txids)} clean-correct illicit tx_ids")
+        except Exception as e:
+            skipped[name] = f"{type(e).__name__}: {e}"
+            print(f"  ⚠ skipping {name}: {skipped[name]}")
+
+    if not per_model_sets:
+        print("No model produced a clean-correct illicit set; cannot intersect.")
+        return
+
+    common_txids: set[str] = set.intersection(*per_model_sets.values())
+    print(f"Common clean-correct illicit tx_ids (intersection): {len(common_txids)}")
+    if not common_txids:
+        print("Empty intersection — no fair common targets across models.")
+        return
+
+    # ---- Step 2: load the static-model attack pipeline (same as run_pgd_attack.py) ----
     if DATASET == "elliptic":
         data = EllipticDataset(EllipticConfig(filter_unknown=False)).get_data()
     elif DATASET == "ellipticpp_actors":
@@ -87,7 +152,12 @@ def main():
         from src.datasets.chronowave_features import build_paper_features, make_consistent_rebuild
         build_paper_features(data)
 
+    # Snapshot tx_ids before .to(device) (PyG's Data.to may drop list attrs).
+    static_tx_ids = list(data.node_id)
+
     data = data.to(device)
+    # Re-attach tx_ids for the index-mapping helper.
+    data.node_id = static_tx_ids
 
     if MODEL_NAME == "chronowave_gnn":
         attack_dim = int(data.raw_feature_dim)
@@ -101,17 +171,17 @@ def main():
     with torch.no_grad():
         logits_clean = forward_logits(model, data.x, data.edge_index, time_step=time_step)
 
-    targets = pick_target_nodes(
-        data, logits_clean, split_mask,
-        only_illicit=ATTACK_ONLY_ILLICIT,
+    # ---- Step 3: pick targets from the common intersection (NOT a per-model filter) ----
+    targets = pick_common_target_nodes(
+        data, common_txids, split_mask,
         fraction=ATTACK_FRACTION,
-        only_clean_correct=ONLY_CLEAN_CORRECT,
         seed=SEED,
         device=device,
     )
     if targets.numel() == 0:
-        print("No eligible target nodes found for the chosen settings.")
+        print("No eligible target nodes found in the common intersection for this split.")
         return
+    print(f"Attacking {targets.numel()} common targets on model {MODEL_NAME!r}.")
 
     atk = PGDAttack(model, data, device, clamp=CLAMP, attack_dim=attack_dim, rebuild_fn=rebuild_fn)
     t_start = time.perf_counter()
@@ -193,6 +263,11 @@ def main():
             "clamp": CLAMP,
         },
         "target_selection": {
+            "mode": "common_clean_correct_illicit_intersection",
+            "common_models": list(COMMON_MODELS),
+            "skipped_models": skipped,
+            "per_model_clean_correct_illicit_count": {k: len(v) for k, v in per_model_sets.items()},
+            "common_intersection_count": len(common_txids),
             "attack_only_illicit": ATTACK_ONLY_ILLICIT,
             "attack_fraction": ATTACK_FRACTION,
             "only_clean_correct": ONLY_CLEAN_CORRECT,

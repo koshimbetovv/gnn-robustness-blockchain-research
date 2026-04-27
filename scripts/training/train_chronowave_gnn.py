@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.datasets.elliptic import EllipticConfig, EllipticDataset
+from src.datasets.chronowave_features import build_paper_features
 from src.models.chronowave_gnn import ChronoWaveGNN
 from src.utils.seed import seed_from_config
 from scripts.training.train_paper_utils import (
@@ -25,42 +26,6 @@ from scripts.training.train_paper_utils import (
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "models", "train_chronowave_gnn.json")
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
-
-def haar_level2_approximation(x: torch.Tensor) -> torch.Tensor:
-    try:
-        import pywt
-    except ImportError as exc:
-        raise ImportError(
-            "ChronoWave-GNN requires PyWavelets for level-2 Haar DWT. "
-            "Install it with: pip install PyWavelets"
-        ) from exc
-
-    x_np = x.detach().cpu().numpy()
-    cA2, *_ = pywt.wavedec(x_np, wavelet="haar", level=2, axis=1)
-    return torch.from_numpy(cA2).to(dtype=x.dtype)
-
-
-@torch.no_grad()
-def standardize_from_train(x: torch.Tensor, train_mask: torch.Tensor) -> torch.Tensor:
-    train_x = x[train_mask]
-    if train_x.numel() == 0:
-        raise ValueError("Train split has no labeled nodes for standardization.")
-    mean = train_x.mean(dim=0, keepdim=True)
-    std = train_x.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-    return (x - mean) / std
-
-
-def build_paper_features(data) -> None:
-    raw_x = data.x.float().cpu()
-    train_mask = split_mask(data, "train").cpu()
-
-    wave_x = haar_level2_approximation(raw_x)
-
-    raw_x = standardize_from_train(raw_x, train_mask)
-    wave_x = standardize_from_train(wave_x, train_mask)
-
-    data.x = torch.cat([raw_x, wave_x], dim=1)
-
 
 def main():
     seed_from_config(CONFIG)

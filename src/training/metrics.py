@@ -173,6 +173,8 @@ def roc_auc_binary(
     y_true = y_true[valid]
     if y_true.size == 0:
         return float("nan")
+    if np.unique(y_true).size < 2:
+        return float("nan")
 
     probs_pos = F.softmax(logits[mask], dim=1)[:, pos_index].detach().cpu().numpy()
     probs_pos = probs_pos[valid]
@@ -182,6 +184,36 @@ def roc_auc_binary(
         return float(roc_auc_score(y_true, probs_pos))
     except ValueError:
         return float("nan")
+
+
+@torch.no_grad()
+def mean_perturbation_l2_on_success(
+    x_clean_rows: torch.Tensor,
+    x_adv_rows: torch.Tensor,
+    pred_clean: torch.Tensor,
+    pred_adv: torch.Tensor,
+    y_true: torch.Tensor,
+) -> Tuple[float, int]:
+    """Average L2 norm of applied perturbation over targets that were
+    clean-correct and flipped after attack (i.e. successful label flips).
+
+    All inputs align over the same set of target nodes:
+      x_clean_rows, x_adv_rows : (n_targets, D_perturb) — features restricted
+                                  to the perturbable column slice.
+      pred_clean, pred_adv, y_true : (n_targets,) long/int tensors.
+
+    Returns (mean_l2, n_flipped). If no successful flips, returns (0.0, 0).
+    """
+    pred_clean = pred_clean.view(-1)
+    pred_adv = pred_adv.view(-1)
+    y_true = y_true.view(-1)
+    success = (pred_clean == y_true) & (pred_adv != y_true)
+    n = int(success.sum().item())
+    if n == 0:
+        return 0.0, 0
+    delta = x_adv_rows[success].float() - x_clean_rows[success].float()
+    l2 = torch.linalg.vector_norm(delta, ord=2, dim=1)
+    return float(l2.mean().item()), n
 
 
 @torch.no_grad()

@@ -7,7 +7,6 @@ from src.models.graphsage import GraphSAGE
 from src.models.gat import GAT
 from src.models.chronowave_gnn import ChronoWaveGNN
 from src.models.recgnn import RecGNN
-from src.models.cosemignn import CoSemiGNN
 
 
 def _list_run_dirs(model_dir: str, model_name: str):
@@ -118,7 +117,6 @@ def build_model(model_name: str, num_features: int, num_classes: int, cfg: dict)
             heads=int(m.get("heads", 4)),
             num_layers=int(m.get("num_layers", 3)),
             dropout=float(m.get("dropout", 0.4)),
-            wavelet_level=int(m.get("wavelet_level", 2)),
         )
 
     if model_name == "recgnn":
@@ -137,6 +135,8 @@ def build_model(model_name: str, num_features: int, num_classes: int, cfg: dict)
         )
 
     if model_name == "cosemignn":
+        from src.models.cosemignn import CoSemiGNN
+
         return CoSemiGNN(
         feature_in=num_features,
         dim=int(m.get("dim", 128)),

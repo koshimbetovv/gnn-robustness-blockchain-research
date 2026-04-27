@@ -8,5 +8,5 @@ results/
 __MACOSX/
 data/
 experiments/
-attacks/
+/attacks/
 /models/
