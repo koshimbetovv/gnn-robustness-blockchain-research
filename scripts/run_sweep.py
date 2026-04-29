@@ -10,12 +10,43 @@ from typing import Any, Dict, List, Tuple
 import yaml
 
 
-ATTACK_TO_SCRIPT = {
-    "fgsm": "scripts/run_fgsm_attack.py",
-    "pgd": "scripts/run_pgd_attack.py",
-    "nettack": "scripts/run_nettack_attack.py",
-    "node_injection": "scripts/run_node_injection_attack.py",
-    "monti": "scripts/run_monti_attack.py",
+# Map (attack, model_family) -> script path. The "static" family covers
+# whole-graph models (gcn, gat, graphsage, chronowave_gnn). Temporal models
+# (recgnn, evolvegcn_o, cosemignn) have their own per-model drivers.
+ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
+    "fgsm": {
+        "static": "scripts/run_fgsm_attack.py",
+        "recgnn": "scripts/run_fgsm_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_fgsm_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_fgsm_attack_cosemignn.py",
+    },
+    "pgd": {
+        "static": "scripts/run_pgd_attack.py",
+        "recgnn": "scripts/run_pgd_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_pgd_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_pgd_attack_cosemignn.py",
+    },
+    "node_injection": {
+        "static": "scripts/run_node_injection_attack.py",
+        "recgnn": "scripts/run_node_injection_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_node_injection_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_node_injection_attack_cosemignn.py",
+    },
+    "nettack": {
+        "static": "scripts/run_nettack_attack.py",
+    },
+    "monti": {
+        "static": "scripts/run_monti_attack.py",
+    },
+}
+
+STATIC_MODELS = {"gcn", "gat", "graphsage", "chronowave_gnn"}
+TEMPORAL_FAMILIES = {"recgnn", "evolvegcn_o", "cosemignn"}
+
+# Map dataset -> model checkpoint directory under repo root.
+DATASET_TO_MODEL_DIR = {
+    "elliptic": "models/Elliptic",
+    "ellipticpp_actors": "models/Elliptic++",
 }
 
 
@@ -25,6 +56,30 @@ def repo_root() -> str:
 
 def attacks_root() -> str:
     return os.path.join(repo_root(), "attacks")
+
+
+def model_family(model_name: str) -> str:
+    if model_name in STATIC_MODELS:
+        return "static"
+    if model_name in TEMPORAL_FAMILIES:
+        return model_name
+    raise ValueError(
+        f"Unknown model '{model_name}'. Static: {sorted(STATIC_MODELS)}, "
+        f"temporal: {sorted(TEMPORAL_FAMILIES)}."
+    )
+
+
+def script_for(attack: str, model_name: str) -> str:
+    family = model_family(model_name)
+    fam_map = ATTACK_TO_SCRIPTS.get(attack)
+    if fam_map is None:
+        raise ValueError(f"Unknown attack '{attack}'. Choose from: {list(ATTACK_TO_SCRIPTS)}")
+    if family not in fam_map:
+        raise ValueError(
+            f"Attack '{attack}' is not implemented for model '{model_name}' "
+            f"(family={family}). Available families: {list(fam_map)}."
+        )
+    return fam_map[family]
 
 
 def load_script_module(name: str, path: str):
@@ -59,9 +114,6 @@ def list_attack_dirs() -> List[str]:
 
 
 def newest_dir(created_after: float, prev_set: set) -> str:
-    """
-    Find the newest directory in attacks/ created after `created_after` and not in prev_set.
-    """
     cand = []
     for d in list_attack_dirs():
         if d in prev_set:
@@ -73,7 +125,6 @@ def newest_dir(created_after: float, prev_set: set) -> str:
         if mt >= created_after - 1e-6:
             cand.append((mt, d))
     if not cand:
-        # fallback: pick newest overall
         all_dirs = [(os.path.getmtime(d), d) for d in list_attack_dirs()]
         if not all_dirs:
             raise RuntimeError("No attacks/* directory found after run.")
@@ -84,9 +135,6 @@ def newest_dir(created_after: float, prev_set: set) -> str:
 
 
 def flatten(obj: Any, prefix: str = "") -> Dict[str, Any]:
-    """
-    Flatten nested dicts into dotted keys; lists become JSON strings.
-    """
     out: Dict[str, Any] = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -124,7 +172,6 @@ def summarize_attacks_to_csv(out_csv: str):
         print("No runs found under attacks/* with config.json + metrics.json.")
         return
 
-    # union columns
     cols = set()
     for r in rows:
         cols |= set(r.keys())
@@ -146,7 +193,6 @@ def apply_globals(mod, overrides: Dict[str, Any]):
 
 
 def normalize_pgd_params(grid: Dict[str, Any]) -> Dict[str, Any]:
-    # If ALPHA == "auto", compute 2*eps/steps
     if "ALPHA" in grid and isinstance(grid["ALPHA"], str) and grid["ALPHA"].lower() == "auto":
         eps = float(grid["EPS"])
         steps = int(grid["STEPS"])
@@ -155,10 +201,6 @@ def normalize_pgd_params(grid: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run_one(mod, run_name: str, overrides: Dict[str, Any]) -> str:
-    """
-    Run mod.main() with globals set; return run_dir.
-    Handles occasional timestamp collisions by retrying on FileExistsError.
-    """
     prev = set(list_attack_dirs())
     start = time.time()
 
@@ -169,12 +211,10 @@ def run_one(mod, run_name: str, overrides: Dict[str, Any]) -> str:
             mod.main()
             break
         except FileExistsError:
-            # timestamp collision: wait and retry
             time.sleep(0.3)
             if attempt == 2:
                 raise
         finally:
-            # small delay to reduce same-second folder collisions
             time.sleep(0.2)
 
     run_dir = newest_dir(start, prev)
@@ -194,55 +234,91 @@ def main():
     models = g.get("models", ["gcn"])
     seeds = g.get("seeds", [0])
 
+    # dataset selection: a list of datasets to sweep (may be a single string).
+    datasets_g = g.get("datasets", g.get("dataset", ["elliptic"]))
+    if isinstance(datasets_g, str):
+        datasets_g = [datasets_g]
+    for ds in datasets_g:
+        if ds not in DATASET_TO_MODEL_DIR:
+            raise ValueError(
+                f"Unknown dataset '{ds}'. Supported: {list(DATASET_TO_MODEL_DIR)}."
+            )
+
     # global target selection defaults
     g_split = g.get("split", "test")
     g_only_illicit = bool(g.get("attack_only_illicit", True))
     g_only_clean_correct = bool(g.get("only_clean_correct", True))
     g_attack_fraction = float(g.get("attack_fraction", 0.02))
 
-    # preload all script modules once
-    modules = {}
-    for attack, rel in ATTACK_TO_SCRIPT.items():
-        path = os.path.join(root, rel)
-        modules[attack] = load_script_module(f"_run_{attack}", path)
+    # cache loaded modules (path -> module)
+    module_cache: Dict[str, Any] = {}
+
+    def get_mod(path: str):
+        if path not in module_cache:
+            module_cache[path] = load_script_module(
+                f"_run_{os.path.splitext(os.path.basename(path))[0]}",
+                os.path.join(root, path),
+            )
+        return module_cache[path]
 
     # run grid
     for sweep in sweeps:
         attack = str(sweep["attack"]).lower()
-        if attack not in modules:
-            raise ValueError(f"Unknown attack '{attack}'. Choose from: {list(modules.keys())}")
+        if attack not in ATTACK_TO_SCRIPTS:
+            raise ValueError(
+                f"Unknown attack '{attack}'. Choose from: {list(ATTACK_TO_SCRIPTS)}"
+            )
 
         param_grid = sweep.get("params", {}) or {}
+        # per-sweep override of models / datasets if provided
+        sweep_models = sweep.get("models") or models
+        sweep_datasets = sweep.get("datasets") or datasets_g
+        if isinstance(sweep_datasets, str):
+            sweep_datasets = [sweep_datasets]
+
         combos = cartesian(param_grid)
 
-        for model_name in models:
-            for seed in seeds:
-                for combo in combos:
-                    overrides = {
-                        "MODEL_NAME": model_name,
-                        "SPLIT": g_split,
-                        "SEED": int(seed),
-                        # common selection knobs (only apply if script has them)
-                        "ATTACK_ONLY_ILLICIT": g_only_illicit,
-                        "ONLY_CLEAN_CORRECT": g_only_clean_correct,
-                        "ATTACK_FRACTION": g_attack_fraction,
-                    }
-                    overrides.update(combo)
+        for dataset in sweep_datasets:
+            model_dir = DATASET_TO_MODEL_DIR[dataset]
+            for model_name in sweep_models:
+                # Skip combinations with no script registered.
+                try:
+                    script_path = script_for(attack, model_name)
+                except ValueError as e:
+                    print(f"skip: {e}")
+                    continue
 
-                    if attack == "pgd":
-                        overrides = normalize_pgd_params(overrides)
+                mod = get_mod(script_path)
 
-                    # Only set variables that exist in that script
-                    mod = modules[attack]
-                    filtered = {k: v for k, v in overrides.items() if hasattr(mod, k)}
+                for seed in seeds:
+                    for combo in combos:
+                        overrides = {
+                            "MODEL_NAME": model_name,
+                            "MODEL_DIR": model_dir,
+                            "DATASET": dataset,
+                            "SPLIT": g_split,
+                            "SEED": int(seed),
+                            "ATTACK_ONLY_ILLICIT": g_only_illicit,
+                            "ONLY_CLEAN_CORRECT": g_only_clean_correct,
+                            "ATTACK_FRACTION": g_attack_fraction,
+                        }
+                        overrides.update(combo)
 
-                    run_id = (
-                        f"{attack}|model={model_name}|seed={seed}|"
-                        + ",".join(f"{k}={filtered[k]}" for k in sorted(filtered) if k not in {"MODEL_NAME", "SPLIT", "SEED"})
-                    )
-                    run_one(mod, run_id, filtered)
+                        if attack == "pgd":
+                            overrides = normalize_pgd_params(overrides)
 
-    # write summary at the end
+                        # Only set variables that exist in the target script.
+                        filtered = {k: v for k, v in overrides.items() if hasattr(mod, k)}
+
+                        run_id = (
+                            f"{attack}|model={model_name}|dataset={dataset}|seed={seed}|"
+                            + ",".join(
+                                f"{k}={filtered[k]}" for k in sorted(filtered)
+                                if k not in {"MODEL_NAME", "MODEL_DIR", "DATASET", "SPLIT", "SEED"}
+                            )
+                        )
+                        run_one(mod, run_id, filtered)
+
     summarize_attacks_to_csv(os.path.join(attacks_root(), "results_summary.csv"))
 
 
