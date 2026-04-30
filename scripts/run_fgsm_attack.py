@@ -156,21 +156,21 @@ def main():
     recall_pos_drop_split = float(clean_m_split.recall_pos - adv_m_split.recall_pos)
 
     print()
-    print(f"FGSM | eps={EPS}")
+    # print(f"FGSM | eps={EPS}")
 
-    print(f"ASR={asr:.6f} ({ns}/{na})")
-    print(f"ASR_pos (illicit flips) = {asr_p:.6f} ({sp}/{ap}), ASR_neg (licit flips) = {asr_n:.6f} ({sn}/{an})")
+    # print(f"ASR={asr:.6f} ({ns}/{na})")
+    # print(f"ASR_pos (illicit flips) = {asr_p:.6f} ({sp}/{ap}), ASR_neg (licit flips) = {asr_n:.6f} ({sn}/{an})")
 
-    print()
-    print(f"[split={SPLIT}, n={clean_m_split.n_labeled}]")
-    print(f"  F1_pos     : {clean_m_split.f1_pos:.4f} -> {adv_m_split.f1_pos:.4f}  (drop {f1_pos_drop_split:.4f})")
-    print(f"  Recall_pos : {clean_m_split.recall_pos:.4f} -> {adv_m_split.recall_pos:.4f}  (drop {recall_pos_drop_split:.4f})")
-    print(f"  F1_macro   : {clean_m_split.f1_macro:.4f} -> {adv_m_split.f1_macro:.4f} (drop {clean_m_split.f1_macro-adv_m_split.f1_macro:.4f})")
-    print(f"  ROC-AUC    : {roc_clean_split:.6f} -> {roc_adv_split:.6f}")
+    # print()
+    # print(f"[split={SPLIT}, n={clean_m_split.n_labeled}]")
+    # print(f"  F1_pos     : {clean_m_split.f1_pos:.4f} -> {adv_m_split.f1_pos:.4f}  (drop {f1_pos_drop_split:.4f})")
+    # print(f"  Recall_pos : {clean_m_split.recall_pos:.4f} -> {adv_m_split.recall_pos:.4f}  (drop {recall_pos_drop_split:.4f})")
+    # print(f"  F1_macro   : {clean_m_split.f1_macro:.4f} -> {adv_m_split.f1_macro:.4f} (drop {clean_m_split.f1_macro-adv_m_split.f1_macro:.4f})")
+    # print(f"  ROC-AUC    : {roc_clean_split:.6f} -> {roc_adv_split:.6f}")
 
-    print(f"Mean confidence drop (attacked, clean-correct): {conf_drop:.6f} over n={n_used}")
-    print(f"Mean L2 perturbation on successful flips: {pert_l2_mean:.6f} over n={pert_l2_n}")
-    print(f"Attack time: {attack_time_seconds:.4f} s")
+    # print(f"Mean confidence drop (attacked, clean-correct): {conf_drop:.6f} over n={n_used}")
+    # print(f"Mean L2 perturbation on successful flips: {pert_l2_mean:.6f} over n={pert_l2_n}")
+    # print(f"Attack time: {attack_time_seconds:.4f} s")
 
 
     run_dir, ts = make_run_dir(MODEL_NAME)

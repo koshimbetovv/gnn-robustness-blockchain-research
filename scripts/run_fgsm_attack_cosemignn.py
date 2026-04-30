@@ -317,26 +317,26 @@ def main():
         }
 
     print()
-    print(f"FGSM CoSemiGNN | eps={EPS}")
-    if concat_classification is not None and concat_attack is not None:
-        print(f"[concatenated across timesteps, n={concat_classification['n_total']}]")
-        print(
-            f"  ASR     : {concat_attack['asr']:.4f} "
-            f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-        )
-        print(
-            f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-            f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-            f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-            f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-        )
-        print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-        print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-        print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-        print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-        print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-        print(f"  Mean L2 pert (on flips)       : {concat_attack['pert_l2_success']:.4f} over n={concat_attack['pert_l2_n']}")
-    print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
+    # print(f"FGSM CoSemiGNN | eps={EPS}")
+    # if concat_classification is not None and concat_attack is not None:
+    #     print(f"[concatenated across timesteps, n={concat_classification['n_total']}]")
+    #     print(
+    #         f"  ASR     : {concat_attack['asr']:.4f} "
+    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
+    #     )
+    #     print(
+    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
+    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
+    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
+    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
+    #     )
+    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
+    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
+    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
+    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
+    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
+    #     print(f"  Mean L2 pert (on flips)       : {concat_attack['pert_l2_success']:.4f} over n={concat_attack['pert_l2_n']}")
+    # print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
 
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {

@@ -20,16 +20,16 @@ from src.utils.attack_targets import pick_target_nodes
 
 # ---------- attack parameters ----------
 MODEL_NAME = "gcn"
-MODEL_DIR = "models/Elliptic++"  # "models/Elliptic" or "models/Elliptic++"
+MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
 #   "ellipticpp_actors"  -> Elliptic++ actors (55 wallet features)
-DATASET = "ellipticpp_actors"
+DATASET = "elliptic"
 SPLIT = "test"
 
 # ---------- node-injection attack hyperparams ----------
 N_INJECT = 5
-EDGES_PER_INJECTED = 10
+EDGES_PER_INJECTED = 20
 EPS = 0.05
 ALPHA = 0.01
 STEPS = 30
@@ -123,6 +123,16 @@ def main():
         model, data, device,
         clamp=CLAMP, attack_dim=attack_dim, rebuild_fn=rebuild_fn, seed=SEED,
     )
+
+    # Init reference: licit nodes inside the attacked split, excluding targets.
+    init_ref_mask = split_mask & (data.y == 0)
+    init_ref_mask[targets] = False
+    init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
+    if init_reference.numel() == 0:
+        raise RuntimeError(
+            "No licit non-target nodes available in the attacked split for feature init."
+        )
+
     t_start = time.perf_counter()
     res = atk.attack(
         target_nodes=targets,
@@ -133,7 +143,7 @@ def main():
         steps=STEPS,
         random_start=RANDOM_START,
         init=INIT,
-        reference_nodes=targets,
+        reference_nodes=init_reference,
         connect_strategy=CONNECT_STRATEGY,
     )
     attack_time_seconds = float(time.perf_counter() - t_start)
@@ -169,26 +179,26 @@ def main():
     n_injected_nodes = int(res.x_adv.size(0) - data.x.size(0))
 
     print()
-    print(
-        f"NodeInjection | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-        f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} "
-        f"connect={CONNECT_STRATEGY}"
-    )
-    print(
-        f"injected_nodes={n_injected_nodes} edges_added={edges_added} "
-        f"n_targets={int(targets.numel())}"
-    )
-    print(f"ASR={asr:.6f} ({ns}/{na})")
-    print(f"ASR_pos (illicit flips) = {asr_p:.6f} ({sp}/{ap}), ASR_neg (licit flips) = {asr_n:.6f} ({sn}/{an})")
+    # print(
+    #     f"NodeInjection | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
+    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} "
+    #     f"connect={CONNECT_STRATEGY}"
+    # )
+    # print(
+    #     f"injected_nodes={n_injected_nodes} edges_added={edges_added} "
+    #     f"n_targets={int(targets.numel())}"
+    # )
+    # print(f"ASR={asr:.6f} ({ns}/{na})")
+    # print(f"ASR_pos (illicit flips) = {asr_p:.6f} ({sp}/{ap}), ASR_neg (licit flips) = {asr_n:.6f} ({sn}/{an})")
 
-    print()
-    print(f"[split={SPLIT}, n={clean_m_split.n_labeled}]")
-    print(f"  F1_pos     : {clean_m_split.f1_pos:.4f} -> {adv_m_split.f1_pos:.4f}  (drop {f1_pos_drop_split:.4f})")
-    print(f"  Recall_pos : {clean_m_split.recall_pos:.4f} -> {adv_m_split.recall_pos:.4f}  (drop {recall_pos_drop_split:.4f})")
-    print(f"  F1_macro   : {clean_m_split.f1_macro:.4f} -> {adv_m_split.f1_macro:.4f} (drop {clean_m_split.f1_macro-adv_m_split.f1_macro:.4f})")
-    print(f"  ROC-AUC    : {roc_clean_split:.6f} -> {roc_adv_split:.6f}")
-    print(f"Mean confidence drop (attacked, clean-correct): {conf_drop:.6f} over n={n_used}")
-    print(f"Attack time: {attack_time_seconds:.4f} s")
+    # print()
+    # print(f"[split={SPLIT}, n={clean_m_split.n_labeled}]")
+    # print(f"  F1_pos     : {clean_m_split.f1_pos:.4f} -> {adv_m_split.f1_pos:.4f}  (drop {f1_pos_drop_split:.4f})")
+    # print(f"  Recall_pos : {clean_m_split.recall_pos:.4f} -> {adv_m_split.recall_pos:.4f}  (drop {recall_pos_drop_split:.4f})")
+    # print(f"  F1_macro   : {clean_m_split.f1_macro:.4f} -> {adv_m_split.f1_macro:.4f} (drop {clean_m_split.f1_macro-adv_m_split.f1_macro:.4f})")
+    # print(f"  ROC-AUC    : {roc_clean_split:.6f} -> {roc_adv_split:.6f}")
+    # print(f"Mean confidence drop (attacked, clean-correct): {conf_drop:.6f} over n={n_used}")
+    # print(f"Attack time: {attack_time_seconds:.4f} s")
 
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {

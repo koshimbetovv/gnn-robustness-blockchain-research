@@ -204,12 +204,21 @@ def main():
 
         labels_true = y[targets].long()
 
+        # Init reference: licit labeled nodes in this snapshot, excluding targets.
+        init_ref_mask = (y == 0)
+        init_ref_mask[targets] = False
+        init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
+        if init_reference.numel() == 0:
+            raise RuntimeError(
+                f"No licit non-target nodes available at timestep {t} for feature init."
+            )
+
         t0 = time.perf_counter()
         res = atk.attack_step(
             x, edge_index, targets, labels_true,
             n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
             eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-            init=INIT, reference_nodes=targets, connect_strategy=CONNECT_STRATEGY,
+            init=INIT, reference_nodes=init_reference, connect_strategy=CONNECT_STRATEGY,
         )
         attack_time_seconds += float(time.perf_counter() - t0)
         total_injected_nodes += len(res.injected_node_ids)
@@ -318,29 +327,29 @@ def main():
         }
 
     print()
-    print(
-        f"NodeInjection RecGNN | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-        f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
-    )
-    print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
-    if concat_classification is not None and concat_attack is not None:
-        print(f"[concatenated across all test timesteps, n={concat_classification['n_total']}]")
-        print(
-            f"  ASR     : {concat_attack['asr']:.4f} "
-            f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-        )
-        print(
-            f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-            f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-            f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-            f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-        )
-        print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-        print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-        print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-        print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-        print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-    print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
+    # print(
+    #     f"NodeInjection RecGNN | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
+    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
+    # )
+    # print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
+    # if concat_classification is not None and concat_attack is not None:
+    #     print(f"[concatenated across all test timesteps, n={concat_classification['n_total']}]")
+    #     print(
+    #         f"  ASR     : {concat_attack['asr']:.4f} "
+    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
+    #     )
+    #     print(
+    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
+    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
+    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
+    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
+    #     )
+    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
+    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
+    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
+    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
+    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
+    # print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
 
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {

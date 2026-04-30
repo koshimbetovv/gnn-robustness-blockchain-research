@@ -190,13 +190,25 @@ def main():
 
         labels_true = label_vals[target_pos].long()
 
+        # Init reference: licit labeled nodes in this window, excluding targets.
+        target_set = set(target_global.detach().cpu().tolist())
+        licit_global = label_idx[label_vals == 0]
+        init_reference = torch.tensor(
+            [int(i) for i in licit_global.detach().cpu().tolist() if int(i) not in target_set],
+            dtype=torch.long, device=device,
+        )
+        if init_reference.numel() == 0:
+            raise RuntimeError(
+                f"No licit non-target nodes available at window t={t} for feature init."
+            )
+
         t0 = time.perf_counter()
         res = atk.attack_window(
             hist_adj_list, hist_ndFeats_list, node_mask_list,
             label_idx, target_global, labels_true,
             n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
             eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-            init=INIT, reference_nodes=target_global, connect_strategy=CONNECT_STRATEGY,
+            init=INIT, reference_nodes=init_reference, connect_strategy=CONNECT_STRATEGY,
         )
         attack_time_seconds += float(time.perf_counter() - t0)
         total_injected_nodes += len(res.injected_node_ids)
@@ -297,29 +309,29 @@ def main():
         }
 
     print()
-    print(
-        f"NodeInjection EvolveGCN-O | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-        f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
-    )
-    print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
-    if concat_classification is not None and concat_attack is not None:
-        print(f"[concatenated across all test windows, n={concat_classification['n_total']}]")
-        print(
-            f"  ASR     : {concat_attack['asr']:.4f} "
-            f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-        )
-        print(
-            f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-            f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-            f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-            f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-        )
-        print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-        print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-        print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-        print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-        print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-    print(f"Attack time (total over test windows): {attack_time_seconds:.4f} s")
+    # print(
+    #     f"NodeInjection EvolveGCN-O | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
+    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
+    # )
+    # print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
+    # if concat_classification is not None and concat_attack is not None:
+    #     print(f"[concatenated across all test windows, n={concat_classification['n_total']}]")
+    #     print(
+    #         f"  ASR     : {concat_attack['asr']:.4f} "
+    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
+    #     )
+    #     print(
+    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
+    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
+    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
+    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
+    #     )
+    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
+    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
+    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
+    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
+    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
+    # print(f"Attack time (total over test windows): {attack_time_seconds:.4f} s")
 
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {
