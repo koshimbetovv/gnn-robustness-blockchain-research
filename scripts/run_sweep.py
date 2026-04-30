@@ -219,6 +219,8 @@ def run_one(mod, run_name: str, overrides: Dict[str, Any]) -> str:
 
     run_dir = newest_dir(start, prev)
     print(f"✓ Completed {run_name} -> {os.path.relpath(run_dir, repo_root())}")
+    print("--------------------------------------------------------------------------------------")
+    print("--------------------------------------------------------------------------------------")
     return run_dir
 
 
@@ -263,6 +265,7 @@ def main():
 
     # run grid
     for sweep in sweeps:
+        
         attack = str(sweep["attack"]).lower()
         if attack not in ATTACK_TO_SCRIPTS:
             raise ValueError(
@@ -277,6 +280,8 @@ def main():
             sweep_datasets = [sweep_datasets]
 
         combos = cartesian(param_grid)
+        combo_len = len(seeds) * len(combos)
+        combo_count = 0
 
         for dataset in sweep_datasets:
             model_dir = DATASET_TO_MODEL_DIR[dataset]
@@ -292,6 +297,7 @@ def main():
 
                 for seed in seeds:
                     for combo in combos:
+                        print(f"Seed: {seed} Progress: {combo_count} / {combo_len}")
                         overrides = {
                             "MODEL_NAME": model_name,
                             "MODEL_DIR": model_dir,
@@ -318,6 +324,7 @@ def main():
                             )
                         )
                         run_one(mod, run_id, filtered)
+                        combo_count += 1
 
     summarize_attacks_to_csv(os.path.join(attacks_root(), "results_summary.csv"))
 
