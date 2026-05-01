@@ -281,11 +281,13 @@ def main():
 
         combos = cartesian(param_grid)
         combo_len = len(seeds) * len(combos)
-        combo_count = 0
+        model_len = len(sweep_models)
+        model_count = 1
 
         for dataset in sweep_datasets:
             model_dir = DATASET_TO_MODEL_DIR[dataset]
             for model_name in sweep_models:
+                combo_count = 1
                 # Skip combinations with no script registered.
                 try:
                     script_path = script_for(attack, model_name)
@@ -297,7 +299,7 @@ def main():
 
                 for seed in seeds:
                     for combo in combos:
-                        print(f"Seed: {seed} Progress: {combo_count} / {combo_len}")
+                        print(f"Seed: {seed} | Model: {model_count}/{model_len} | Progress: {combo_count} / {combo_len}")
                         overrides = {
                             "MODEL_NAME": model_name,
                             "MODEL_DIR": model_dir,
@@ -325,6 +327,7 @@ def main():
                         )
                         run_one(mod, run_id, filtered)
                         combo_count += 1
+                model_count += 1
 
     summarize_attacks_to_csv(os.path.join(attacks_root(), "results_summary.csv"))
 
