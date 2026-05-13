@@ -12,6 +12,7 @@ class EvolveGCNNodeInjectionResult:
     node_mask_list: List[torch.Tensor]
     label_idx: torch.Tensor             # passed through unchanged (existing node ids)
     logits_adv: torch.Tensor            # logits at `label_idx` (existing-only)
+    x_injected_base: torch.Tensor       # (n_inject, F_last) before PGD on injected rows
     injected_node_ids: list[int]
     injected_edges: list[tuple[int, int]]
 
@@ -220,6 +221,7 @@ class EvolveGCNNodeInjectionAttack:
                 node_mask_list=[m.clone() for m in node_mask_list],
                 label_idx=label_idx,
                 logits_adv=logits,
+                x_injected_base=base_last.new_empty((0, base_last.size(1))),
                 injected_node_ids=[],
                 injected_edges=[],
             )
@@ -278,6 +280,7 @@ class EvolveGCNNodeInjectionAttack:
             node_mask_list=hist_mask_aug,
             label_idx=label_idx,
             logits_adv=logits_adv,
+            x_injected_base=base_inj.detach(),
             injected_node_ids=injected_ids.detach().cpu().tolist(),
             injected_edges=new_edges,
         )

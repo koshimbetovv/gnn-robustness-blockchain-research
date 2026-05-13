@@ -9,39 +9,52 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.datasets.cosemignn_elliptic import load_cosemignn_elliptic
 from src.datasets.cosemignn_ellipticpp_addraddr import load_cosemignn_ellipticpp_addraddr
-from src.attacks.node_injection_cosemignn import CoSemiGNNNodeInjectionAttack
+from src.attacks.nettack_adapted_temporal import (
+    AdaptedNettackTemporalAttack, train_surrogate_on_train_slices,
+)
 from src.utils.model_loader import resolve_checkpoint
+from src.utils.seed import set_seed
 from src.training.metrics import (
     binary_classification_metrics, attack_success_rate, roc_auc_binary,
-    mean_confidence_drop, asr_pos_neg,
+    mean_confidence_drop, asr_pos_neg, mean_perturbation_l2_on_success,
 )
 from src.models.cosemignn import CoSemiGNN
 
 # ---------- attack parameters ----------
 MODEL_NAME = "cosemignn"
-MODEL_DIR = "models/Elliptic"
+MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
-#   "elliptic"           -> Elliptic (165 raw + 6 semi = 171 features)
-#   "ellipticpp_actors"  -> Elliptic++ actors (55 raw + 6 semi = 61 features)
-DATASET = "elliptic"
+#   "elliptic"           -> Elliptic (165 tx features)
+#   "ellipticpp_actors"  -> Elliptic++ actors (55 wallet features)
+DATASET = "elliptic"  # "elliptic" or "ellipticpp_actors"
 RUN_ID = None
 
-# ---------- node-injection attack hyperparams ----------
-N_INJECT = 5
-EDGES_PER_INJECTED = 20
-EPS = 0.05
-ALPHA = 0.01
-STEPS = 30
-RANDOM_START = True
-INIT = "mean"
+# Adapted-NETTACK threat model:
+#   N_STRUCT  : maximum number of edge ADDITIONS per target (no deletions).
+#   EPS_FEAT  : per-target L2 budget for the closed-form continuous feature step.
+#   CLAMP     : optional [lo, hi] clip applied to the final x_adv (e.g. (-3.0, 3.0)).
+N_STRUCT = 2
+EPS_FEAT = 0.05
 CLAMP = None
-CONNECT_STRATEGY = "round_robin"
+
+# Power-law chi^2 unnoticeability test (Eqs. 6-9 in the paper).
+D_MIN = 2
+CHI2_TAU = 0.004
+ENFORCE_DEGREE_CONSTRAINT = True
+
+# Surrogate (linearized 2-layer GCN) training params.
+SURROGATE_EPOCHS = 200
+SURROGATE_LR = 0.01
+SURROGATE_WEIGHT_DECAY = 5e-4
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
 ATTACK_FRACTION = 1.0
 ONLY_CLEAN_CORRECT = True
 SEED = 0
+
+VERBOSE = False
+PROGRESS_EVERY = 100
 
 
 def get_device():
@@ -55,7 +68,7 @@ def get_device():
 def make_run_dir(model_name: str):
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_node_injection_{ts}")
+    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_adapted_nettack_{ts}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir, ts
 
@@ -65,26 +78,19 @@ def write_json(path: str, obj: dict):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def pick_targets_slice(labels, pred_clean, only_illicit, only_clean_correct, fraction, seed):
-    if not (0.0 < float(fraction) <= 1.0):
-        raise ValueError(f"ATTACK_FRACTION must be in (0, 1], got {fraction}")
-    idx = torch.arange(labels.numel(), device=labels.device)
-    idx = idx[labels != -1]
-    if only_illicit:
-        idx = idx[labels[idx] == 1]
-    if only_clean_correct and idx.numel() > 0:
-        idx = idx[pred_clean[idx] == labels[idx]]
-    if idx.numel() == 0:
-        return idx
-    n = max(1, min(int(round(float(fraction) * float(idx.numel()))), int(idx.numel())))
-    g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed))
-    perm = torch.randperm(idx.numel(), generator=g)
-    return idx[perm[:n].to(idx.device)]
+def cosemi_forward_logits(model, features, edge_index, ca_weights):
+    """Lift CoSemiGNN's BCE-style `(N,)` output to `(N, 2)` `[0, s]`, matching
+    the convention used by `pgd_cosemignn.py`. Argmax and CE on `[0, s]` agree
+    with BCE-with-logits on `s`.
+    """
+    out_line, _ = model(features, edge_index, ca_weights)
+    return torch.stack([torch.zeros_like(out_line), out_line], dim=1)
 
 
 def main():
     device = get_device()
+    set_seed(SEED, deterministic=True, benchmark=False)
+    print(f"Random seed set to {SEED} (deterministic=True)")
 
     ckpt_path, ckpt_run_dir = resolve_checkpoint(MODEL_NAME, model_dir=MODEL_DIR, run_id=RUN_ID)
     with open(os.path.join(ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
@@ -92,6 +98,8 @@ def main():
 
     data_cfg = ckpt_cfg["data"]
     time_cfg = ckpt_cfg["time"]
+    train_start = int(time_cfg.get("train_start", 1))
+    train_end = int(time_cfg.get("train_end", time_cfg.get("predict_start", 1)))
     predict_start = int(time_cfg["predict_start"])
     predict_end = int(time_cfg["predict_end"])
     semi_cache_dir = data_cfg["semi_cache_dir"]
@@ -116,11 +124,14 @@ def main():
             rebuild_semi=bool(data_cfg.get("rebuild_semi", False)),
         )
     else:
-        raise ValueError(
-            f"Unknown DATASET={DATASET!r}. Supported: 'elliptic', 'ellipticpp_actors'."
-        )
+        raise ValueError(f"Unknown DATASET={DATASET!r}.")
+
     feature_list, adj_list, label_list, _ca_matrix_list, ca_weights_list, *_ = data
 
+    # Determine feature dimensions from the first non-empty slice. CoSemiGNN
+    # features are `[raw (D_raw) || semi (6)]`; only the leading raw_dim columns
+    # are perturbable (the 6 semi columns come from a non-differentiable cached
+    # auxiliary classifier, just like in PGD-CoSemi).
     feature_in = None
     for ft in feature_list[1:]:
         if ft is not None and ft.numel() > 0:
@@ -147,8 +158,48 @@ def main():
     model.eval()
     print(f"✓ Loaded {MODEL_NAME.upper()} from {ckpt_path}")
 
-    atk = CoSemiGNNNodeInjectionAttack(model, device, raw_feature_dim=raw_feature_dim, clamp=CLAMP)
+    # ----- train surrogate on union of train timesteps -----
+    print("Training surrogate (linearized GCN) on union of train timesteps ...")
+    train_slices = []
+    for t in range(train_start, train_end + 1):
+        if t >= len(feature_list):
+            break
+        ft = feature_list[t]; adj = adj_list[t]; lbl = label_list[t]
+        if ft is None or lbl is None or ft.numel() == 0 or lbl.numel() == 0:
+            continue
+        # CoSemiGNN labels are 0/1 (no -1), but be defensive.
+        train_mask = (lbl != -1)
+        if int(train_mask.sum().item()) == 0:
+            continue
+        train_slices.append((ft.float(), adj.long(), lbl.long(), train_mask))
+    if not train_slices:
+        raise RuntimeError("No CoSemiGNN train slices found for surrogate training.")
+    W = train_surrogate_on_train_slices(
+        train_slices,
+        num_features=feature_in,
+        num_classes=2,
+        device=device,
+        epochs=SURROGATE_EPOCHS,
+        lr=SURROGATE_LR,
+        weight_decay=SURROGATE_WEIGHT_DECAY,
+    )
 
+    # NETTACK perturbs the leading raw_feature_dim columns; the trailing 6 semi
+    # columns are frozen oracle outputs (matching PGD-CoSemi convention).
+    atk = AdaptedNettackTemporalAttack(
+        W=W, device=device,
+        attack_dim=raw_feature_dim,
+        clamp=CLAMP,
+        d_min=D_MIN, chi2_tau=CHI2_TAU,
+        enforce_degree_constraint=ENFORCE_DEGREE_CONSTRAINT,
+        verbose=VERBOSE, progress_every=PROGRESS_EVERY,
+    )
+
+    # ----- per-timestep attack -----
+    # NOTE: CoSemiGNN's CMOS LSTM advances state on every forward; we follow the
+    # same pattern as `run_pgd_attack_cosemignn.py` and do not save/restore
+    # state. This means the adv forward starts from a slightly different state
+    # than the clean forward did, but it matches the existing benchmark.
     per_slice = []
     pooled_y_true = []
     pooled_pred_clean = []
@@ -156,11 +207,9 @@ def main():
     pooled_logits_clean = []
     pooled_logits_adv = []
     pooled_attack_mask = []
-    pooled_injected_l2 = []
-    pooled_injected_abs = []
-    pooled_injected_signed = []
-    total_injected_nodes = 0
-    total_edges_added = 0
+    pooled_delta_success = []
+    n_unique_added_total = 0
+    n_targets_with_edge_total = 0
     attack_time_seconds = 0.0
 
     for t in range(predict_start, predict_end):
@@ -177,17 +226,18 @@ def main():
             continue
 
         with torch.no_grad():
-            logits_clean = atk.forward_logits(features, adj, ca_weights)
+            logits_clean = cosemi_forward_logits(model, features, adj, ca_weights).detach()
         pred_clean = logits_clean.argmax(dim=1)
 
-        targets = pick_targets_slice(
-            labels, pred_clean,
-            only_illicit=ATTACK_ONLY_ILLICIT,
-            only_clean_correct=ONLY_CLEAN_CORRECT,
-            fraction=ATTACK_FRACTION,
-            seed=SEED + t,
-        )
-        if targets.numel() == 0:
+        # Pick targets among labeled positions.
+        idx = torch.arange(labels.numel(), device=device)
+        idx = idx[labels[idx] != -1]
+        if ATTACK_ONLY_ILLICIT:
+            idx = idx[labels[idx] == 1]
+        if ONLY_CLEAN_CORRECT and idx.numel() > 0:
+            idx = idx[pred_clean[idx] == labels[idx]]
+
+        if idx.numel() == 0:
             per_slice.append({"t": t, "n_labeled": int(labels.numel()), "n_targets": 0, "skipped": True})
             pooled_y_true.append(labels.detach().cpu())
             pooled_pred_clean.append(pred_clean.detach().cpu())
@@ -197,29 +247,26 @@ def main():
             pooled_attack_mask.append(torch.zeros(labels.numel(), dtype=torch.bool))
             continue
 
-        labels_true = labels[targets].long()
+        if 0.0 < float(ATTACK_FRACTION) < 1.0:
+            n = max(1, min(int(round(ATTACK_FRACTION * float(idx.numel()))), int(idx.numel())))
+            g = torch.Generator(device="cpu")
+            g.manual_seed(int(SEED + t))
+            perm = torch.randperm(idx.numel(), generator=g)
+            idx = idx[perm[:n].to(idx.device)]
 
-        # Init reference: licit labeled nodes in this slice, excluding targets.
-        init_ref_mask = (labels == 0)
-        init_ref_mask[targets] = False
-        init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
-        if init_reference.numel() == 0:
-            raise RuntimeError(
-                f"No licit non-target nodes available at slice t={t} for feature init."
-            )
+        targets = idx
 
         t0 = time.perf_counter()
-        res = atk.attack_slice(
-            features, adj, targets, labels_true,
-            n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
-            eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-            init=INIT, reference_nodes=init_reference, connect_strategy=CONNECT_STRATEGY,
-            ca_weights=ca_weights,
+        x_adv, edge_index_adv, info = atk.attack_slice(
+            features.float(), adj.long(), labels.long(), targets,
+            n_struct=N_STRUCT, eps_feat=EPS_FEAT,
         )
         attack_time_seconds += float(time.perf_counter() - t0)
-        total_injected_nodes += len(res.injected_node_ids)
-        total_edges_added += len(res.injected_edges)
-        logits_adv = res.logits_adv
+        n_unique_added_total += int(info["n_unique_edges_added"])
+        n_targets_with_edge_total += int(info["n_targets_with_edge_added"])
+
+        with torch.no_grad():
+            logits_adv = cosemi_forward_logits(model, x_adv, edge_index_adv, ca_weights).detach()
         pred_adv = logits_adv.argmax(dim=1)
 
         attack_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=device)
@@ -235,25 +282,22 @@ def main():
         adv_m = binary_classification_metrics(labels, pred_adv)
 
         conf_drop, n_used = mean_confidence_drop(
-            labels, logits_clean, logits_adv, attack_mask, only_clean_correct=True
+            labels, logits_clean, logits_adv, attack_mask, only_clean_correct=True,
         )
 
-        if len(res.injected_node_ids) > 0:
-            clean_inj = res.x_injected_base[:, :atk.raw_dim]
-            adv_inj = res.x_adv[res.injected_node_ids, :atk.raw_dim]
-            delta_inj = (adv_inj - clean_inj).float()
-            per_node_l2 = torch.linalg.vector_norm(delta_inj, ord=2, dim=1)
-            pert_l2_mean = float(per_node_l2.mean().item())
-            pert_l2_n = int(per_node_l2.numel())
-            avg_perturbation = float(delta_inj.abs().mean().item())
-            avg_perturbation_signed = float(delta_inj.mean().item())
-            pooled_injected_l2.append(per_node_l2.detach().cpu())
-            pooled_injected_abs.append(delta_inj.abs().reshape(-1).detach().cpu())
-            pooled_injected_signed.append(delta_inj.reshape(-1).detach().cpu())
-        else:
-            pert_l2_mean, pert_l2_n = 0.0, 0
-            avg_perturbation = 0.0
-            avg_perturbation_signed = 0.0
+        clean_rows = features[targets, :raw_feature_dim]
+        adv_rows = x_adv[targets, :raw_feature_dim]
+        pred_clean_targets = pred_clean[targets]
+        pred_adv_targets = pred_adv[targets]
+        y_targets = labels[targets].long()
+        pert_l2_mean, pert_l2_n = mean_perturbation_l2_on_success(
+            clean_rows, adv_rows, pred_clean_targets, pred_adv_targets, y_targets,
+        )
+        success_mask_targets = (pred_clean_targets == y_targets) & (pred_adv_targets != y_targets)
+        if int(success_mask_targets.sum().item()) > 0:
+            pooled_delta_success.append(
+                (adv_rows[success_mask_targets].float() - clean_rows[success_mask_targets].float()).detach().cpu()
+            )
 
         f1_pos_drop = float(clean_m["f1_pos"] - adv_m["f1_pos"])
         recall_pos_drop = float(clean_m["recall_pos"] - adv_m["recall_pos"])
@@ -262,8 +306,8 @@ def main():
             "t": t,
             "n_labeled": int(labels.numel()),
             "n_targets": int(targets.numel()),
-            "n_injected_nodes": len(res.injected_node_ids),
-            "edges_added": len(res.injected_edges),
+            "n_unique_edges_added": int(info["n_unique_edges_added"]),
+            "n_directed_edges_added": int(info["n_directed_edges_added"]),
             "asr": asr, "asr_success": ns, "asr_attempted": na,
             "asr_pos": asr_p, "asr_pos_success": sp, "asr_pos_attempted": ap,
             "asr_neg": asr_n, "asr_neg_success": sn, "asr_neg_attempted": an,
@@ -272,10 +316,7 @@ def main():
             "recall_pos_clean": clean_m["recall_pos"], "recall_pos_adv": adv_m["recall_pos"], "recall_pos_drop": recall_pos_drop,
             "roc_auc_clean": roc_clean, "roc_auc_adv": roc_adv,
             "mean_confidence_drop": conf_drop, "conf_drop_n": n_used,
-            "perturbation_l2_on_injected_nodes": pert_l2_mean,
-            "perturbation_l2_n_injected_nodes": pert_l2_n,
-            "avg_perturbation": avg_perturbation,
-            "avg_perturbation_signed": avg_perturbation_signed,
+            "pert_l2_success": pert_l2_mean, "pert_l2_n": pert_l2_n,
         })
 
         pooled_y_true.append(labels.detach().cpu())
@@ -285,10 +326,13 @@ def main():
         pooled_logits_adv.append(logits_adv.detach().cpu())
         pooled_attack_mask.append(attack_mask.detach().cpu())
 
+        roc_c_show = roc_clean if roc_clean == roc_clean else float("nan")
+        roc_a_show = roc_adv if roc_adv == roc_adv else float("nan")
         print(
             f"t={t:2d}  n_labeled={labels.numel():5d}  n_targets={targets.numel():4d}  "
-            f"ASR={asr:.4f} ({ns}/{na})  F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
-            f"ROC {roc_clean if roc_clean==roc_clean else float('nan'):.3f}->{roc_adv if roc_adv==roc_adv else float('nan'):.3f}"
+            f"edges+={info['n_unique_edges_added']:3d}  ASR={asr:.4f} ({ns}/{na})  "
+            f"F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
+            f"ROC {roc_c_show:.3f}->{roc_a_show:.3f}"
         )
 
     # ---------- aggregation ----------
@@ -310,28 +354,24 @@ def main():
 
         asr_c, ns_c, na_c = attack_success_rate(y_true, pred_clean_c, pred_adv_c, attack_mask_c)
         asr_cp, sp_c, ap_c, asr_cn, sn_c, an_c = asr_pos_neg(y_true, logits_clean_c, logits_adv_c, attack_mask_c)
-
         conf_drop_c, conf_drop_n_c = mean_confidence_drop(
-            y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True
+            y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True,
         )
 
-        if pooled_injected_l2:
-            pert_l2_c = float(torch.cat(pooled_injected_l2).mean().item())
-            pert_l2_n_c = int(torch.cat(pooled_injected_l2).numel())
-            avg_perturbation_c = float(torch.cat(pooled_injected_abs).mean().item())
-            avg_perturbation_signed_c = float(torch.cat(pooled_injected_signed).mean().item())
+        if pooled_delta_success:
+            delta_all = torch.cat(pooled_delta_success, dim=0)
+            pert_l2_c = float(torch.linalg.vector_norm(delta_all, ord=2, dim=1).mean().item())
+            pert_l2_n_c = int(delta_all.size(0))
         else:
             pert_l2_c, pert_l2_n_c = 0.0, 0
-            avg_perturbation_c, avg_perturbation_signed_c = 0.0, 0.0
-
-        f1_pos_drop_c = float(clean_c["f1_pos"] - adv_c["f1_pos"])
-        recall_pos_drop_c = float(clean_c["recall_pos"] - adv_c["recall_pos"])
 
         concat_classification = {
             "n_total": int(y_true.numel()),
-            "f1_pos_clean": clean_c["f1_pos"], "f1_pos_adv": adv_c["f1_pos"], "f1_pos_drop": f1_pos_drop_c,
+            "f1_pos_clean": clean_c["f1_pos"], "f1_pos_adv": adv_c["f1_pos"],
+            "f1_pos_drop": float(clean_c["f1_pos"] - adv_c["f1_pos"]),
             "f1_macro_clean": clean_c["f1_macro"], "f1_macro_adv": adv_c["f1_macro"],
-            "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"], "recall_pos_drop": recall_pos_drop_c,
+            "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"],
+            "recall_pos_drop": float(clean_c["recall_pos"] - adv_c["recall_pos"]),
             "roc_auc_clean": roc_c_clean, "roc_auc_adv": roc_c_adv,
         }
         concat_attack = {
@@ -340,50 +380,28 @@ def main():
             "asr_pos": asr_cp, "asr_pos_success": sp_c, "asr_pos_attempted": ap_c,
             "asr_neg": asr_cn, "asr_neg_success": sn_c, "asr_neg_attempted": an_c,
             "mean_confidence_drop": conf_drop_c, "conf_drop_n": conf_drop_n_c,
-            "perturbation_l2_on_injected_nodes": pert_l2_c,
-            "perturbation_l2_n_injected_nodes": pert_l2_n_c,
-            "avg_perturbation": avg_perturbation_c,
-            "avg_perturbation_signed": avg_perturbation_signed_c,
+            "pert_l2_success": pert_l2_c, "pert_l2_n": pert_l2_n_c,
+            "n_unique_edges_added_total": n_unique_added_total,
+            "n_targets_with_edge_added_total": n_targets_with_edge_total,
         }
 
     print()
-    # print(
-    #     f"NodeInjection CoSemiGNN | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
-    # )
-    # print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
-    # if concat_classification is not None and concat_attack is not None:
-    #     print(f"[concatenated across timesteps, n={concat_classification['n_total']}]")
-    #     print(
-    #         f"  ASR     : {concat_attack['asr']:.4f} "
-    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-    #     )
-    #     print(
-    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-    #     )
-    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-    # print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
-
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {
         "timestamp": ts,
-        "attack": "NodeInjectionEvasion",
+        "attack": "AdaptedNETTACK",
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
         "dataset": DATASET,
         "checkpoint_path": ckpt_path,
         "device": str(device),
         "attack_params": {
-            "n_inject": N_INJECT, "edges_per_injected": EDGES_PER_INJECTED,
-            "eps": EPS, "alpha": ALPHA, "steps": STEPS, "random_start": RANDOM_START,
-            "init": INIT, "clamp": CLAMP, "connect_strategy": CONNECT_STRATEGY,
+            "n_struct": N_STRUCT, "eps_feat": EPS_FEAT, "clamp": CLAMP,
+            "d_min": D_MIN, "chi2_tau": CHI2_TAU,
+            "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "surrogate_epochs": SURROGATE_EPOCHS,
+            "surrogate_lr": SURROGATE_LR,
+            "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
             "raw_feature_dim": raw_feature_dim,
         },
         "timesteps": {"predict_start": predict_start, "predict_end": predict_end},
@@ -400,7 +418,7 @@ def main():
     write_json(os.path.join(run_dir, "config.json"), config)
 
     metrics = {
-        "attack": "NodeInjectionEvasion",
+        "attack": "AdaptedNETTACK",
         "model_name": MODEL_NAME,
         "dataset": DATASET,
         "classification": {
@@ -410,10 +428,6 @@ def main():
         "attack_effect": {
             "attack_time_seconds": attack_time_seconds,
             "aggregate_concat": concat_attack,
-        },
-        "injection": {
-            "total_injected_nodes": total_injected_nodes,
-            "total_edges_added": total_edges_added,
         },
         "per_timestep": per_slice,
     }

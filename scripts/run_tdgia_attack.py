@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.datasets.elliptic import EllipticDataset, EllipticConfig
 from src.datasets.ellipticpp_actors import EllipticPPActorsDataset, EllipticPPActorsConfig
-from src.attacks.node_injection_evasion import NodeInjectionEvasionAttack
+from src.attacks.tdgia import TDGIAAttack
 from src.attacks.model_forward import forward_logits, STATIC_MODELS
 from src.utils.model_loader import load_model
 from src.training.metrics import (
@@ -17,27 +17,30 @@ from src.training.metrics import (
     roc_auc_binary, mean_confidence_drop, asr_pos_neg,
 )
 from src.utils.attack_targets import pick_target_nodes
+from src.utils.seed import set_seed
 
 # ---------- attack parameters ----------
 MODEL_NAME = "gcn"
-MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
+MODEL_DIR = "models/Elliptic"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
 #   "ellipticpp_actors"  -> Elliptic++ actors (55 wallet features)
 DATASET = "elliptic"
 SPLIT = "test"
 
-# ---------- node-injection attack hyperparams ----------
+# ---------- TDGIA hyperparameters ----------
 N_INJECT = 5
-EDGES_PER_INJECTED = 20
-EPS = 0.05
-ALPHA = 0.01
+DEGREE_LIMIT = 20
+BATCH_SIZE = 1
 STEPS = 30
-RANDOM_START = True
-INIT = "randn"          # "mean" or "randn"
-CLAMP = None           # e.g. (-3.0, 3.0)
-CONNECT_STRATEGY = "round_robin"  # "round_robin" := broader coverage across targets or 
-                                  # "all_to_all" := denser concentration on the same targets.
+LR = 0.05
+SMOOTH_R = 0.5
+ALPHA_MU = 0.5
+K1 = 1.0
+K2 = 1.0
+INIT = "randn"         # "zeros", "mean", "randn"
+SIGMA_SCALE = 1.0
+CLAMP = None           # None -> infer feature range from data; else e.g. (-3.0, 3.0)
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
@@ -53,10 +56,9 @@ def get_device():
 
 
 def make_run_dir(model_name: str):
-    """Create attacks/model_node_injection_YYYYMMDD_HHMMSS/ under repo root."""
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_node_injection_{ts}")
+    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_tdgia_{ts}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir, ts
 
@@ -69,13 +71,14 @@ def write_json(path: str, obj: dict):
 def main():
     if MODEL_NAME not in STATIC_MODELS:
         raise NotImplementedError(
-            f"{MODEL_NAME!r} is not a static-feature model supported by this node-injection driver. "
-            f"Temporal/sequence models (e.g. recgnn, evolvegcn_o, cosemignn) require a different "
-            f"threat model; use a temporal node-injection script. Supported here: {STATIC_MODELS}."
+            f"{MODEL_NAME!r} is not a static-feature model supported by this TDGIA driver. "
+            f"Temporal/sequence models require a different TDGIA threat model. "
+            f"Supported here: {STATIC_MODELS}."
         )
 
     device = get_device()
-    torch.manual_seed(SEED)
+    set_seed(SEED, deterministic=True, benchmark=False)
+    print(f"Random seed set to {SEED} (deterministic=True)")
 
     if DATASET == "elliptic":
         data = EllipticDataset(EllipticConfig(filter_unknown=False)).get_data()
@@ -86,7 +89,6 @@ def main():
             f"Unknown DATASET={DATASET!r}. Supported: 'elliptic', 'ellipticpp_actors'."
         )
 
-    # ChronoWaveGNN: rebuild [standardized_raw || standardized_Haar-level2(raw)] before .to(device).
     attack_dim = None
     rebuild_fn = None
     if MODEL_NAME == "chronowave_gnn":
@@ -100,7 +102,6 @@ def main():
         rebuild_fn = make_consistent_rebuild(data)
 
     model = load_model(MODEL_NAME, data.num_features, 2, device=device, model_dir=MODEL_DIR)
-
     time_step = getattr(data, "time_step", None)
 
     split_mask = get_split_mask(data, SPLIT).to(device)
@@ -119,47 +120,47 @@ def main():
         print("No eligible target nodes found for the chosen settings.")
         return
 
-    atk = NodeInjectionEvasionAttack(
-        model, data, device,
-        clamp=CLAMP, attack_dim=attack_dim, rebuild_fn=rebuild_fn, seed=SEED,
-    )
-
-    # Init reference: licit nodes inside the attacked split, excluding targets.
     init_ref_mask = split_mask & (data.y == 0)
     init_ref_mask[targets] = False
     init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
     if init_reference.numel() == 0:
-        raise RuntimeError(
-            "No licit non-target nodes available in the attacked split for feature init."
-        )
+        init_reference = None
+
+    atk = TDGIAAttack(
+        model,
+        data,
+        device,
+        clamp=CLAMP,
+        attack_dim=attack_dim,
+        rebuild_fn=rebuild_fn,
+    )
 
     t_start = time.perf_counter()
     res = atk.attack(
         target_nodes=targets,
         n_inject=N_INJECT,
-        edges_per_injected=EDGES_PER_INJECTED,
-        eps=EPS,
-        alpha=ALPHA,
+        degree_limit=DEGREE_LIMIT,
+        batch_size=BATCH_SIZE,
         steps=STEPS,
-        random_start=RANDOM_START,
+        lr=LR,
+        smooth_r=SMOOTH_R,
+        alpha_mu=ALPHA_MU,
+        k1=K1,
+        k2=K2,
         init=INIT,
         reference_nodes=init_reference,
-        connect_strategy=CONNECT_STRATEGY,
+        sigma_scale=SIGMA_SCALE,
     )
     attack_time_seconds = float(time.perf_counter() - t_start)
 
     with torch.no_grad():
         logits_adv_full = forward_logits(model, res.x_adv, res.edge_index_adv, time_step=res.time_step_adv)
-
-    # IMPORTANT: evaluate only on original nodes (injected nodes are appended).
     logits_adv = logits_adv_full[: data.num_nodes]
 
-    # Attacked-only mask (recommended when ATTACK_FRACTION < 1).
     attack_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
     attack_mask[targets] = True
     attack_mask = attack_mask & split_mask
 
-    # Split-wide metrics
     roc_clean_split = roc_auc_binary(logits_clean, data.y, split_mask)
     roc_adv_split = roc_auc_binary(logits_adv, data.y, split_mask)
     clean_m_split = evaluate_logits_on_split(logits_clean, data.y, split_mask, SPLIT)
@@ -168,18 +169,15 @@ def main():
     conf_drop, n_used = mean_confidence_drop(
         data.y, logits_clean, logits_adv, attack_mask, only_clean_correct=True
     )
-
     asr, ns, na = attack_success_rate(data.y, logits_clean.argmax(1), logits_adv.argmax(1), attack_mask)
     asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(data.y, logits_clean, logits_adv, attack_mask)
 
-    # Injection-specific perturbation accounting: compute once over the injected
-    # nodes themselves, not once per successful attacked target.
     if len(res.injected_node_ids) > 0:
         pert_dim = int(atk.attack_dim)
         clean_inj = res.x_injected_base[:, :pert_dim]
         adv_inj = res.x_adv[res.injected_node_ids, :pert_dim]
-        delta_inj = adv_inj - clean_inj
-        per_node_l2 = torch.linalg.vector_norm(delta_inj.float(), ord=2, dim=1)
+        delta_inj = (adv_inj - clean_inj).float()
+        per_node_l2 = torch.linalg.vector_norm(delta_inj, ord=2, dim=1)
         pert_l2_mean = float(per_node_l2.mean().item())
         pert_l2_n = int(per_node_l2.numel())
         avg_perturbation = float(delta_inj.abs().mean().item())
@@ -195,32 +193,10 @@ def main():
     edges_added = int(res.edge_index_adv.size(1) - data.edge_index.size(1))
     n_injected_nodes = int(res.x_adv.size(0) - data.x.size(0))
 
-    print()
-    # print(
-    #     f"NodeInjection | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} "
-    #     f"connect={CONNECT_STRATEGY}"
-    # )
-    # print(
-    #     f"injected_nodes={n_injected_nodes} edges_added={edges_added} "
-    #     f"n_targets={int(targets.numel())}"
-    # )
-    # print(f"ASR={asr:.6f} ({ns}/{na})")
-    # print(f"ASR_pos (illicit flips) = {asr_p:.6f} ({sp}/{ap}), ASR_neg (licit flips) = {asr_n:.6f} ({sn}/{an})")
-
-    # print()
-    # print(f"[split={SPLIT}, n={clean_m_split.n_labeled}]")
-    # print(f"  F1_pos     : {clean_m_split.f1_pos:.4f} -> {adv_m_split.f1_pos:.4f}  (drop {f1_pos_drop_split:.4f})")
-    # print(f"  Recall_pos : {clean_m_split.recall_pos:.4f} -> {adv_m_split.recall_pos:.4f}  (drop {recall_pos_drop_split:.4f})")
-    # print(f"  F1_macro   : {clean_m_split.f1_macro:.4f} -> {adv_m_split.f1_macro:.4f} (drop {clean_m_split.f1_macro-adv_m_split.f1_macro:.4f})")
-    # print(f"  ROC-AUC    : {roc_clean_split:.6f} -> {roc_adv_split:.6f}")
-    # print(f"Mean confidence drop (attacked, clean-correct): {conf_drop:.6f} over n={n_used}")
-    # print(f"Attack time: {attack_time_seconds:.4f} s")
-
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {
         "timestamp": ts,
-        "attack": "NodeInjectionEvasion",
+        "attack": "TDGIA",
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
         "dataset": DATASET,
@@ -228,14 +204,18 @@ def main():
         "device": str(device),
         "attack_params": {
             "n_inject": N_INJECT,
-            "edges_per_injected": EDGES_PER_INJECTED,
-            "eps": EPS,
-            "alpha": ALPHA,
+            "degree_limit": DEGREE_LIMIT,
+            "batch_size": BATCH_SIZE,
             "steps": STEPS,
-            "random_start": RANDOM_START,
+            "lr": LR,
+            "smooth_r": SMOOTH_R,
+            "alpha_mu": ALPHA_MU,
+            "k1": K1,
+            "k2": K2,
             "init": INIT,
+            "sigma_scale": SIGMA_SCALE,
             "clamp": CLAMP,
-            "connect_strategy": CONNECT_STRATEGY,
+            "surrogate": "victim_model",
         },
         "target_selection": {
             "attack_only_illicit": ATTACK_ONLY_ILLICIT,
@@ -248,7 +228,7 @@ def main():
     write_json(os.path.join(run_dir, "config.json"), config)
 
     metrics = {
-        "attack": "NodeInjectionEvasion",
+        "attack": "TDGIA",
         "model_name": MODEL_NAME,
         "dataset": DATASET,
         "classification": {

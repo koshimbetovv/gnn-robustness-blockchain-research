@@ -11,6 +11,7 @@ class CoSemiNodeInjectionResult:
     edge_index_adv: torch.Tensor     # (2, E_existing + 2 * E_injected)
     logits_adv: torch.Tensor         # (n_existing, 2) — sliced to original nodes
     logits_clean: torch.Tensor       # (n_existing, 2)
+    x_injected_base: torch.Tensor    # (n_inject, raw_dim + 6) before PGD on injected rows
     injected_node_ids: list[int]
     injected_edges: list[tuple[int, int]]
 
@@ -178,6 +179,7 @@ class CoSemiGNNNodeInjectionAttack:
                 edge_index_adv=adj.clone(),
                 logits_adv=logits_clean.clone(),
                 logits_clean=logits_clean,
+                x_injected_base=features.new_empty((0, features.size(1))),
                 injected_node_ids=[],
                 injected_edges=[],
             )
@@ -219,6 +221,7 @@ class CoSemiGNNNodeInjectionAttack:
             edge_index_adv=edge_index_adv.detach(),
             logits_adv=logits_adv_full[:n_existing],
             logits_clean=logits_clean,
+            x_injected_base=base_inj.detach(),
             injected_node_ids=injected_ids.detach().cpu().tolist(),
             injected_edges=new_edges,
         )

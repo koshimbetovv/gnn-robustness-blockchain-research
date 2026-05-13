@@ -11,6 +11,7 @@ class RecGNNNodeInjectionResult:
     edge_index_adv: torch.Tensor     # (2, E_existing + E_injected)
     log_probs_adv: torch.Tensor      # (n_existing, num_classes) — sliced to original nodes
     log_probs_clean: torch.Tensor    # (n_existing, num_classes)
+    x_injected_base: torch.Tensor    # (n_inject, F) before PGD on injected rows
     injected_node_ids: list[int]     # global node ids assigned to injected rows (within this timestep)
     injected_edges: list[tuple[int, int]]
 
@@ -215,6 +216,7 @@ class RecGNNNodeInjectionAttack:
                 edge_index_adv=edge_index.clone(),
                 log_probs_adv=log_probs_clean.clone(),
                 log_probs_clean=log_probs_clean,
+                x_injected_base=x.new_empty((0, x.size(1))),
                 injected_node_ids=[],
                 injected_edges=[],
             )
@@ -276,6 +278,7 @@ class RecGNNNodeInjectionAttack:
             edge_index_adv=edge_index_adv.detach(),
             log_probs_adv=log_probs_adv_full[:n_existing],
             log_probs_clean=log_probs_clean,
+            x_injected_base=base_inj.detach(),
             injected_node_ids=injected_ids.detach().cpu().tolist(),
             injected_edges=new_edges,
         )

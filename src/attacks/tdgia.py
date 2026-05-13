@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import torch
+import torch.nn.functional as F
+
+from src.attacks.base_attack import BaseAttack
+from src.attacks.model_forward import forward_logits
+
+
+@dataclass
+class TDGIAResult:
+    x_adv: torch.Tensor
+    edge_index_adv: torch.Tensor
+    y_adv: torch.Tensor
+    time_step_adv: Optional[torch.Tensor]
+    x_injected_base: torch.Tensor
+    injected_node_ids: list[int]
+    injected_edges: list[tuple[int, int]]
+
+
+class TDGIAAttack(BaseAttack):
+    """TDGIA-style graph injection attack for static node-classification models.
+
+    This adapts the paper's two main stages to the repo's static setting:
+      1. topological defective edge selection
+      2. smooth adversarial optimization of injected-node features
+
+    The attack is sequential: injected nodes are added in batches, each batch is
+    connected to the currently most vulnerable targets, and then its features are
+    optimized while keeping existing-node features fixed.
+    """
+
+    def __init__(
+        self,
+        model,
+        data,
+        device,
+        clamp: tuple[float, float] | None = None,
+        attack_dim: Optional[int] = None,
+        rebuild_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ):
+        super().__init__(model, data, device)
+        self.x = data.x.to(device).detach()
+        self.y = data.y.to(device)
+        self.edge_index = data.edge_index.to(device)
+        ts = getattr(data, "time_step", None)
+        self.time_step = ts.to(device) if torch.is_tensor(ts) else None
+        self.clamp = clamp
+        self.attack_dim = int(attack_dim) if attack_dim is not None else int(self.x.size(1))
+        if not (1 <= self.attack_dim <= self.x.size(1)):
+            raise ValueError(f"attack_dim must be in [1, {self.x.size(1)}], got {self.attack_dim}")
+        self.rebuild_fn = rebuild_fn
+
+    def _feature_range(self) -> tuple[float, float]:
+        if self.clamp is not None:
+            return float(self.clamp[0]), float(self.clamp[1])
+        xmin = float(self.x[:, : self.attack_dim].min().item())
+        xmax = float(self.x[:, : self.attack_dim].max().item())
+        if not torch.isfinite(torch.tensor([xmin, xmax])).all() or xmin == xmax:
+            pad = 1.0
+            return xmin - pad, xmax + pad
+        return xmin, xmax
+
+    def _init_injected_features(
+        self,
+        n_inject: int,
+        *,
+        init: str = "randn",
+        reference_nodes: Optional[torch.Tensor] = None,
+        sigma_scale: float = 1.0,
+        feat_min: float,
+        feat_max: float,
+    ) -> torch.Tensor:
+        if reference_nodes is None or reference_nodes.numel() == 0:
+            ref = self.x
+        else:
+            ref = self.x[reference_nodes]
+
+        if init == "zeros":
+            base = torch.zeros((n_inject, self.x.size(1)), device=self.device)
+        elif init == "mean":
+            base = ref.mean(dim=0, keepdim=True).repeat(n_inject, 1)
+        elif init == "randn":
+            mu = ref.mean(dim=0, keepdim=True)
+            std = ref.std(dim=0, keepdim=True).clamp_min(1e-6)
+            base = mu + float(sigma_scale) * torch.randn((n_inject, self.x.size(1)), device=self.device) * std
+        else:
+            raise ValueError(f"Unknown init={init!r}")
+
+        base[:, : self.attack_dim] = base[:, : self.attack_dim].clamp(min=feat_min, max=feat_max)
+        return base.detach()
+
+    def _apply_injected_raw(self, x_existing: torch.Tensor, raw_inj: torch.Tensor, base_inj: torch.Tensor) -> torch.Tensor:
+        if self.attack_dim == self.x.size(1):
+            inj = raw_inj
+        else:
+            other = base_inj[:, self.attack_dim:]
+            inj = torch.cat([raw_inj, other], dim=1)
+        x_full = torch.cat([x_existing, inj], dim=0)
+        if self.rebuild_fn is not None:
+            x_full = self.rebuild_fn(x_full)
+        return x_full
+
+    @staticmethod
+    def _smoothmap(latent: torch.Tensor, feat_min: float, feat_max: float) -> torch.Tensor:
+        mid = 0.5 * (feat_max + feat_min)
+        amp = 0.5 * (feat_max - feat_min)
+        return mid + amp * torch.sin(latent)
+
+    @staticmethod
+    def _inv_smoothmap(x: torch.Tensor, feat_min: float, feat_max: float) -> torch.Tensor:
+        mid = 0.5 * (feat_max + feat_min)
+        amp = max(0.5 * (feat_max - feat_min), 1e-6)
+        scaled = ((x - mid) / amp).clamp(min=-0.999999, max=0.999999)
+        return torch.asin(scaled)
+
+    @staticmethod
+    def _build_injection_edges(
+        injected_ids: torch.Tensor,
+        target_nodes_sorted: torch.Tensor,
+        degree_limit: int,
+    ) -> list[tuple[int, int]]:
+        if injected_ids.numel() == 0 or target_nodes_sorted.numel() == 0 or degree_limit <= 0:
+            return []
+
+        total_needed = int(injected_ids.numel()) * int(degree_limit)
+        reps = (total_needed + int(target_nodes_sorted.numel()) - 1) // int(target_nodes_sorted.numel())
+        tiled_targets = target_nodes_sorted.repeat(reps)[:total_needed]
+
+        edges: list[tuple[int, int]] = []
+        ptr = 0
+        for inj in injected_ids.tolist():
+            for _ in range(int(degree_limit)):
+                dst = int(tiled_targets[ptr].item())
+                edges.append((int(inj), dst))
+                ptr += 1
+        return edges
+
+    def _extend_time_step(
+        self,
+        time_step_curr: Optional[torch.Tensor],
+        injected_edges: list[tuple[int, int]],
+        injected_ids: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if time_step_curr is None:
+            return None
+
+        inj_to_ts: dict[int, int] = {}
+        for src, dst in injected_edges:
+            if src not in inj_to_ts:
+                inj_to_ts[src] = int(time_step_curr[int(dst)].item())
+
+        ts_new = []
+        for inj in injected_ids.tolist():
+            ts_new.append(inj_to_ts.get(int(inj), 0))
+        ts_inj = torch.tensor(ts_new, device=self.device, dtype=time_step_curr.dtype)
+        return torch.cat([time_step_curr, ts_inj], dim=0)
+
+    @staticmethod
+    def _degree_total(num_nodes: int, edge_index: torch.Tensor, device: torch.device) -> torch.Tensor:
+        row = edge_index[0].long()
+        col = edge_index[1].long()
+        deg = torch.zeros(num_nodes, device=device, dtype=torch.float32)
+        deg.scatter_add_(0, row, torch.ones_like(row, dtype=torch.float32))
+        deg.scatter_add_(0, col, torch.ones_like(col, dtype=torch.float32))
+        return deg.clamp_min_(1.0)
+
+    def _defective_scores(
+        self,
+        *,
+        x_curr: torch.Tensor,
+        edge_index_curr: torch.Tensor,
+        time_step_curr: Optional[torch.Tensor],
+        target_nodes: torch.Tensor,
+        surrogate_labels: torch.Tensor,
+        degree_limit: int,
+        alpha_mu: float,
+        k1: float,
+        k2: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            logits = forward_logits(self.model, x_curr, edge_index_curr, time_step=time_step_curr)
+            probs = F.softmax(logits[target_nodes], dim=1)
+            pv = probs.gather(1, surrogate_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
+
+        deg = self._degree_total(x_curr.size(0), edge_index_curr, x_curr.device)[target_nodes]
+        d = float(max(int(degree_limit), 1))
+        lam = float(k1) / torch.sqrt(deg * d) + float(k2) / deg
+        mu = (float(alpha_mu) * pv + (1.0 - float(alpha_mu))) * lam
+        return mu, pv
+
+    def _optimize_batch_features(
+        self,
+        *,
+        x_existing: torch.Tensor,
+        base_inj: torch.Tensor,
+        edge_index_adv: torch.Tensor,
+        time_step_adv: Optional[torch.Tensor],
+        target_nodes: torch.Tensor,
+        surrogate_labels: torch.Tensor,
+        feat_min: float,
+        feat_max: float,
+        steps: int,
+        lr: float,
+        smooth_r: float,
+    ) -> torch.Tensor:
+        latent = self._inv_smoothmap(base_inj[:, : self.attack_dim], feat_min, feat_max).detach()
+        latent.requires_grad_(True)
+        opt = torch.optim.Adam([latent], lr=float(lr))
+
+        for _ in range(int(steps)):
+            opt.zero_grad()
+            raw_inj = self._smoothmap(latent, feat_min, feat_max)
+            x_adv = self._apply_injected_raw(x_existing, raw_inj, base_inj)
+            logits = forward_logits(self.model, x_adv, edge_index_adv, time_step=time_step_adv)
+            probs = F.softmax(logits[target_nodes], dim=1)
+            pv = probs.gather(1, surrogate_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
+            loss = torch.relu(float(smooth_r) + torch.log(pv)).pow(2).mean()
+            loss.backward()
+            opt.step()
+
+        raw_final = self._smoothmap(latent.detach(), feat_min, feat_max)
+        return self._apply_injected_raw(x_existing, raw_final, base_inj).detach()
+
+    def attack(
+        self,
+        target_nodes: torch.Tensor,
+        *,
+        n_inject: int = 5,
+        degree_limit: int = 20,
+        batch_size: int = 1,
+        steps: int = 30,
+        lr: float = 0.05,
+        smooth_r: float = 0.5,
+        alpha_mu: float = 0.5,
+        k1: float = 1.0,
+        k2: float = 1.0,
+        init: str = "randn",
+        reference_nodes: Optional[torch.Tensor] = None,
+        sigma_scale: float = 1.0,
+    ) -> TDGIAResult:
+        if not torch.is_tensor(target_nodes):
+            target_nodes = torch.tensor(target_nodes, dtype=torch.long)
+        target_nodes = target_nodes.to(self.device).long().view(-1)
+        target_nodes = torch.unique(target_nodes)
+
+        labeled_mask = self.y[target_nodes] != -1
+        target_nodes = target_nodes[labeled_mask]
+        if target_nodes.numel() == 0 or int(n_inject) <= 0:
+            return TDGIAResult(
+                x_adv=self.x.clone(),
+                edge_index_adv=self.edge_index.clone(),
+                y_adv=self.y.clone(),
+                time_step_adv=None if self.time_step is None else self.time_step.clone(),
+                x_injected_base=self.x.new_empty((0, self.x.size(1))),
+                injected_node_ids=[],
+                injected_edges=[],
+            )
+
+        feat_min, feat_max = self._feature_range()
+
+        with torch.no_grad():
+            logits_clean = forward_logits(self.model, self.x, self.edge_index, time_step=self.time_step)
+            surrogate_labels = logits_clean[target_nodes].argmax(dim=1)
+
+        x_curr = self.x.clone()
+        edge_index_curr = self.edge_index.clone()
+        y_curr = self.y.clone()
+        time_step_curr = None if self.time_step is None else self.time_step.clone()
+
+        all_base_inj: list[torch.Tensor] = []
+        injected_node_ids: list[int] = []
+        injected_edges: list[tuple[int, int]] = []
+
+        remaining = int(n_inject)
+        batch_size = max(1, int(batch_size))
+        degree_limit = max(1, int(degree_limit))
+
+        while remaining > 0:
+            bseq = min(batch_size, remaining)
+
+            mu, _ = self._defective_scores(
+                x_curr=x_curr,
+                edge_index_curr=edge_index_curr,
+                time_step_curr=time_step_curr,
+                target_nodes=target_nodes,
+                surrogate_labels=surrogate_labels,
+                degree_limit=degree_limit,
+                alpha_mu=alpha_mu,
+                k1=k1,
+                k2=k2,
+            )
+            order = torch.argsort(mu, descending=True)
+            sorted_targets = target_nodes[order]
+
+            n0 = x_curr.size(0)
+            inj_ids = torch.arange(n0, n0 + bseq, device=self.device, dtype=torch.long)
+            base_inj = self._init_injected_features(
+                bseq,
+                init=init,
+                reference_nodes=reference_nodes,
+                sigma_scale=sigma_scale,
+                feat_min=feat_min,
+                feat_max=feat_max,
+            )
+            batch_edges = self._build_injection_edges(inj_ids, sorted_targets, degree_limit)
+            if batch_edges:
+                add_ei = torch.tensor(batch_edges, dtype=torch.long, device=self.device).t().contiguous()
+                edge_index_adv = torch.cat([edge_index_curr, add_ei], dim=1)
+            else:
+                edge_index_adv = edge_index_curr.clone()
+
+            y_adv = torch.cat(
+                [y_curr, torch.full((bseq,), -1, device=self.device, dtype=y_curr.dtype)], dim=0
+            )
+            time_step_adv = self._extend_time_step(time_step_curr, batch_edges, inj_ids)
+
+            x_adv = self._optimize_batch_features(
+                x_existing=x_curr,
+                base_inj=base_inj,
+                edge_index_adv=edge_index_adv,
+                time_step_adv=time_step_adv,
+                target_nodes=target_nodes,
+                surrogate_labels=surrogate_labels,
+                feat_min=feat_min,
+                feat_max=feat_max,
+                steps=steps,
+                lr=lr,
+                smooth_r=smooth_r,
+            )
+
+            x_curr = x_adv
+            edge_index_curr = edge_index_adv
+            y_curr = y_adv
+            time_step_curr = time_step_adv
+
+            all_base_inj.append(base_inj.detach())
+            injected_node_ids.extend(inj_ids.detach().cpu().tolist())
+            injected_edges.extend(batch_edges)
+            remaining -= bseq
+
+        x_injected_base = (
+            torch.cat(all_base_inj, dim=0)
+            if all_base_inj
+            else self.x.new_empty((0, self.x.size(1)))
+        )
+
+        return TDGIAResult(
+            x_adv=x_curr.detach(),
+            edge_index_adv=edge_index_curr.detach(),
+            y_adv=y_curr.detach(),
+            time_step_adv=None if time_step_curr is None else time_step_curr.detach(),
+            x_injected_base=x_injected_base.detach(),
+            injected_node_ids=injected_node_ids,
+            injected_edges=injected_edges,
+        )

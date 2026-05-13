@@ -15,6 +15,7 @@ class NodeInjectionResult:
     edge_index_adv: torch.Tensor
     y_adv: torch.Tensor
     time_step_adv: Optional[torch.Tensor]
+    x_injected_base: torch.Tensor
     injected_node_ids: list[int]
     injected_edges: list[tuple[int, int]]  # (src, dst)
 
@@ -207,6 +208,7 @@ class NodeInjectionEvasionAttack(BaseAttack):
                 edge_index_adv=self.edge_index.clone(),
                 y_adv=self.y.clone(),
                 time_step_adv=None if self.time_step is None else self.time_step.clone(),
+                x_injected_base=self.x.new_empty((0, self.x.size(1))),
                 injected_node_ids=[],
                 injected_edges=[],
             )
@@ -259,6 +261,7 @@ class NodeInjectionEvasionAttack(BaseAttack):
             edge_index_adv=edge_index_adv.detach(),
             y_adv=y_adv.detach(),
             time_step_adv=None if time_step_adv is None else time_step_adv.detach(),
+            x_injected_base=base_inj.detach(),
             injected_node_ids=injected_ids.detach().cpu().tolist(),
             injected_edges=new_edges,
         )

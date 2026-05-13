@@ -11,36 +11,47 @@ from src.datasets.recgnn_elliptic import RecGNNEllipticConfig, RecGNNEllipticDat
 from src.datasets.recgnn_ellipticpp_actors import (
     RecGNNEllipticPPActorsConfig, RecGNNEllipticPPActorsDataset,
 )
-from src.attacks.node_injection_recgnn import RecGNNNodeInjectionAttack
-from src.utils.model_loader import load_model
+from src.attacks.nettack_adapted_temporal import (
+    AdaptedNettackTemporalAttack, train_surrogate_on_train_slices,
+)
+from src.utils.model_loader import load_model, resolve_checkpoint
+from src.utils.seed import set_seed
 from src.training.metrics import (
     binary_classification_metrics, attack_success_rate, roc_auc_binary,
-    mean_confidence_drop, asr_pos_neg,
+    mean_confidence_drop, asr_pos_neg, mean_perturbation_l2_on_success,
 )
 
 # ---------- attack parameters ----------
 MODEL_NAME = "recgnn"
-MODEL_DIR = "models/Elliptic"
+MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
-#   "elliptic"           -> Elliptic (93 local + 2 ANF = 95 features)
-#   "ellipticpp_actors"  -> Elliptic++ actors (55 local + 2 ANF = 57 features)
-DATASET = "elliptic"
+#   "elliptic"           -> Elliptic (165 tx features)
+#   "ellipticpp_actors"  -> Elliptic++ actors (55 wallet features)
+DATASET = "elliptic"  # "elliptic" or "ellipticpp_actors"
 RUN_ID = None
 
-# ---------- node-injection attack hyperparams ----------
-N_INJECT = 5
-EDGES_PER_INJECTED = 20
-EPS = 0.05
-ALPHA = 0.01
-STEPS = 30
-RANDOM_START = True
-INIT = "mean"
+# Adapted-NETTACK threat model:
+#   N_STRUCT  : maximum number of edge ADDITIONS per target (no deletions).
+#   EPS_FEAT  : per-target L2 budget for the closed-form continuous feature step.
+#   CLAMP     : optional [lo, hi] clip applied to the final x_adv (e.g. (-3.0, 3.0)).
+N_STRUCT = 2
+EPS_FEAT = 0.05
 CLAMP = None
-CONNECT_STRATEGY = "round_robin"
-# Number of local (controllable) feature columns. The trailing 2 ANF columns
-# are antecedent-neighbor-label counts derived from the graph and are not
-# attacker-controllable for an injected node either, so they are excluded
-# from `delta`. `None` selects the dataset-appropriate default.
+
+# Power-law chi^2 unnoticeability test (Eqs. 6-9 in the paper).
+D_MIN = 2
+CHI2_TAU = 0.004
+ENFORCE_DEGREE_CONSTRAINT = True
+
+# Surrogate (linearized 2-layer GCN) training params.
+SURROGATE_EPOCHS = 200
+SURROGATE_LR = 0.01
+SURROGATE_WEIGHT_DECAY = 5e-4
+
+# Number of controllable feature columns. RecGNN appends 2 ANF (antecedent
+# neighbour-label count) columns derived from the graph; they're not directly
+# controllable by perturbing the target's own feature row, so NETTACK only
+# touches the leading raw slice. `None` -> dataset-appropriate default.
 ATTACK_DIM = None
 
 # ---------- target selection controls ----------
@@ -48,6 +59,9 @@ ATTACK_ONLY_ILLICIT = True
 ATTACK_FRACTION = 1.0
 ONLY_CLEAN_CORRECT = True
 SEED = 0
+
+VERBOSE = False
+PROGRESS_EVERY = 100
 
 
 def get_device():
@@ -61,7 +75,7 @@ def get_device():
 def make_run_dir(model_name: str):
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_node_injection_{ts}")
+    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_adapted_nettack_{ts}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir, ts
 
@@ -71,14 +85,7 @@ def write_json(path: str, obj: dict):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def pick_targets_graph(
-    y: torch.Tensor,
-    pred_clean: torch.Tensor,
-    only_illicit: bool,
-    only_clean_correct: bool,
-    fraction: float,
-    seed: int,
-) -> torch.Tensor:
+def pick_targets_graph(y, pred_clean, only_illicit, only_clean_correct, fraction, seed):
     if not (0.0 < float(fraction) <= 1.0):
         raise ValueError(f"ATTACK_FRACTION must be in (0, 1], got {fraction}")
     idx = torch.arange(y.numel(), device=y.device)
@@ -96,41 +103,92 @@ def pick_targets_graph(
     return idx[perm[:n].to(idx.device)]
 
 
+def _save_state(model):
+    ml = model.m_lstm
+    ev = ml.cell.evolve_linear
+    def _c(t): return t.detach().clone() if t is not None else None
+    return {
+        "h": _c(ml._h_state), "c": _c(ml._c_state),
+        "ev_h": _c(ev._row_h), "ev_c": _c(ev._row_c),
+        "ev_w": _c(ev._current_weight),
+    }
+
+
+def _restore_state(model, snap):
+    ml = model.m_lstm
+    ev = ml.cell.evolve_linear
+    def _c(t): return t.detach().clone() if t is not None else None
+    ml._h_state = _c(snap["h"]); ml._c_state = _c(snap["c"])
+    ev._row_h = _c(snap["ev_h"]); ev._row_c = _c(snap["ev_c"])
+    ev._current_weight = _c(snap["ev_w"])
+
+
 def main():
     device = get_device()
+    set_seed(SEED, deterministic=True, benchmark=False)
+    print(f"Random seed set to {SEED} (deterministic=True)")
 
-    from src.utils.model_loader import resolve_checkpoint
     ckpt_path, ckpt_run_dir = resolve_checkpoint(MODEL_NAME, model_dir=MODEL_DIR, run_id=RUN_ID)
     with open(os.path.join(ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
         ckpt_cfg = json.load(f)
 
     if DATASET == "elliptic":
         data_cfg = RecGNNEllipticConfig(**ckpt_cfg["data"])
-        print(f"Loading RecGNN Elliptic sequence (filter_unknown={data_cfg.filter_unknown}) ...")
         sequence = RecGNNEllipticDataset(data_cfg).get_sequence()
         default_attack_dim = 93
     elif DATASET == "ellipticpp_actors":
         data_cfg = RecGNNEllipticPPActorsConfig(**ckpt_cfg["data"])
-        print(f"Loading RecGNN Elliptic++ Actors sequence (filter_unknown={data_cfg.filter_unknown}) ...")
         sequence = RecGNNEllipticPPActorsDataset(data_cfg).get_sequence()
         default_attack_dim = sequence.num_features - 2
     else:
-        raise ValueError(
-            f"Unknown DATASET={DATASET!r}. Supported: 'elliptic', 'ellipticpp_actors'."
-        )
+        raise ValueError(f"Unknown DATASET={DATASET!r}.")
 
     attack_dim = default_attack_dim if ATTACK_DIM is None else int(ATTACK_DIM)
 
-    model = load_model(MODEL_NAME, sequence.num_features, 2, device=device, model_dir=MODEL_DIR, run_id=RUN_ID)
-    print(
-        f"Train graphs: {len(sequence.train_graphs)} | Test graphs: {len(sequence.test_graphs)} | "
-        f"num_features={sequence.num_features} | attack_dim={attack_dim}"
+    model = load_model(MODEL_NAME, sequence.num_features, 2, device=device,
+                       model_dir=MODEL_DIR, run_id=RUN_ID)
+    print(f"Train graphs: {len(sequence.train_graphs)}  Test graphs: {len(sequence.test_graphs)}  "
+          f"num_features={sequence.num_features}  attack_dim={attack_dim}")
+
+    # ----- train surrogate on union of train timesteps -----
+    print("Training surrogate (linearized GCN) on union of train timesteps ...")
+    train_slices = []
+    for g in sequence.train_graphs:
+        g = g.to(device)
+        # Use ALL labeled nodes in the train slice as surrogate-training data.
+        train_mask = (g.y != -1)
+        if int(train_mask.sum().item()) == 0:
+            continue
+        train_slices.append((g.x.float(), g.edge_index.long(), g.y.long(), train_mask))
+    W = train_surrogate_on_train_slices(
+        train_slices,
+        num_features=sequence.num_features,
+        num_classes=2,
+        device=device,
+        epochs=SURROGATE_EPOCHS,
+        lr=SURROGATE_LR,
+        weight_decay=SURROGATE_WEIGHT_DECAY,
     )
 
-    atk = RecGNNNodeInjectionAttack(model, device, attack_dim=attack_dim, clamp=CLAMP)
-    print("Priming sequence state over train graphs ...")
-    atk.prime(sequence.train_graphs)
+    atk = AdaptedNettackTemporalAttack(
+        W=W, device=device,
+        attack_dim=attack_dim,
+        clamp=CLAMP,
+        d_min=D_MIN, chi2_tau=CHI2_TAU,
+        enforce_degree_constraint=ENFORCE_DEGREE_CONSTRAINT,
+        verbose=VERBOSE, progress_every=PROGRESS_EVERY,
+    )
 
+    # ----- prime sequence state on clean train graphs -----
+    print("Priming sequence state over train graphs ...")
+    model.reset_sequence_state(device)
+    with torch.no_grad():
+        for g in sequence.train_graphs:
+            g = g.to(device)
+            _ = model(g.x.float(), g.edge_index.long())
+            model.detach_sequence_state()
+
+    # ----- per-timestep attack -----
     per_timestep = []
     pooled_y_true = []
     pooled_pred_clean = []
@@ -138,11 +196,9 @@ def main():
     pooled_logits_clean = []
     pooled_logits_adv = []
     pooled_attack_mask = []
-    pooled_injected_l2 = []
-    pooled_injected_abs = []
-    pooled_injected_signed = []
-    total_injected_nodes = 0
-    total_edges_added = 0
+    pooled_delta_success = []
+    n_unique_added_total = 0
+    n_targets_with_edge_total = 0
     attack_time_seconds = 0.0
 
     for graph in sequence.test_graphs:
@@ -154,27 +210,23 @@ def main():
 
         labeled_mask = y != -1
         if int(labeled_mask.sum().item()) == 0:
-            atk.attack_step(
-                x, edge_index,
-                torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, dtype=torch.long, device=device),
-                n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
-                eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-                init=INIT, connect_strategy=CONNECT_STRATEGY,
-            )
+            # Advance state along clean trajectory and skip.
+            with torch.no_grad():
+                _ = model(x, edge_index)
+                model.detach_sequence_state()
             per_timestep.append({"t": t, "n_labeled": 0, "n_targets": 0, "skipped": True})
             continue
 
-        # Clean preview to pick targets without disturbing sequence state.
-        snap = atk._save_state()
+        # Save pre-state, run clean forward, save post-state.
+        snap_pre = _save_state(model)
         with torch.no_grad():
-            log_probs_preview = atk._forward(x, edge_index).detach()
+            log_probs_clean = model(x, edge_index).detach()
             model.detach_sequence_state()
-        atk._restore_state(snap)
-        pred_preview = log_probs_preview.argmax(dim=1)
+        snap_post = _save_state(model)
+        pred_clean = log_probs_clean.argmax(dim=1)
 
         targets = pick_targets_graph(
-            y, pred_preview,
+            y, pred_clean,
             only_illicit=ATTACK_ONLY_ILLICIT,
             only_clean_correct=ONLY_CLEAN_CORRECT,
             fraction=ATTACK_FRACTION,
@@ -182,59 +234,41 @@ def main():
         )
 
         if targets.numel() == 0:
-            res = atk.attack_step(
-                x, edge_index,
-                torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, dtype=torch.long, device=device),
-                n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
-                eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-                init=INIT, connect_strategy=CONNECT_STRATEGY,
-            )
-            pred_clean = res.log_probs_clean.argmax(dim=1)
-            per_timestep.append({
-                "t": t,
-                "n_labeled": int(labeled_mask.sum().item()),
-                "n_targets": 0,
-                "skipped": True,
-            })
+            # No attackable targets: keep clean trajectory, pool clean as adv.
+            _restore_state(model, snap_post)
+            per_timestep.append({"t": t, "n_labeled": int(labeled_mask.sum().item()),
+                                 "n_targets": 0, "skipped": True})
             pooled_y_true.append(y[labeled_mask].detach().cpu())
             pooled_pred_clean.append(pred_clean[labeled_mask].detach().cpu())
             pooled_pred_adv.append(pred_clean[labeled_mask].detach().cpu())
-            pooled_logits_clean.append(res.log_probs_clean[labeled_mask].detach().cpu())
-            pooled_logits_adv.append(res.log_probs_clean[labeled_mask].detach().cpu())
+            pooled_logits_clean.append(log_probs_clean[labeled_mask].detach().cpu())
+            pooled_logits_adv.append(log_probs_clean[labeled_mask].detach().cpu())
             pooled_attack_mask.append(torch.zeros(int(labeled_mask.sum().item()), dtype=torch.bool))
             continue
 
-        labels_true = y[targets].long()
-
-        # Init reference: licit labeled nodes in this snapshot, excluding targets.
-        init_ref_mask = (y == 0)
-        init_ref_mask[targets] = False
-        init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
-        if init_reference.numel() == 0:
-            raise RuntimeError(
-                f"No licit non-target nodes available at timestep {t} for feature init."
-            )
-
+        # NETTACK queries only the (stateless) surrogate -- no victim state touched.
         t0 = time.perf_counter()
-        res = atk.attack_step(
-            x, edge_index, targets, labels_true,
-            n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
-            eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
-            init=INIT, reference_nodes=init_reference, connect_strategy=CONNECT_STRATEGY,
+        x_adv, edge_index_adv, info = atk.attack_slice(
+            x, edge_index, y, targets, n_struct=N_STRUCT, eps_feat=EPS_FEAT,
         )
         attack_time_seconds += float(time.perf_counter() - t0)
-        total_injected_nodes += len(res.injected_node_ids)
-        total_edges_added += len(res.injected_edges)
+        n_unique_added_total += int(info["n_unique_edges_added"])
+        n_targets_with_edge_total += int(info["n_targets_with_edge_added"])
 
-        pred_clean = res.log_probs_clean.argmax(dim=1)
-        pred_adv = res.log_probs_adv.argmax(dim=1)
+        # Restore pre-state, run adv forward.
+        _restore_state(model, snap_pre)
+        with torch.no_grad():
+            log_probs_adv = model(x_adv, edge_index_adv).detach()
+            model.detach_sequence_state()
+        # Restore post-state so the next test timestep continues on the clean trajectory.
+        _restore_state(model, snap_post)
 
+        pred_adv = log_probs_adv.argmax(dim=1)
         y_lab = y[labeled_mask]
         pred_clean_lab = pred_clean[labeled_mask]
         pred_adv_lab = pred_adv[labeled_mask]
-        logits_clean_lab = res.log_probs_clean[labeled_mask]
-        logits_adv_lab = res.log_probs_adv[labeled_mask]
+        logits_clean_lab = log_probs_clean[labeled_mask]
+        logits_adv_lab = log_probs_adv[labeled_mask]
 
         attack_mask_full = torch.zeros(y.numel(), dtype=torch.bool, device=device)
         attack_mask_full[targets] = True
@@ -250,25 +284,23 @@ def main():
         adv_m = binary_classification_metrics(y_lab, pred_adv_lab)
 
         conf_drop, n_used = mean_confidence_drop(
-            y_lab, logits_clean_lab, logits_adv_lab, attack_mask_lab, only_clean_correct=True
+            y_lab, logits_clean_lab, logits_adv_lab, attack_mask_lab, only_clean_correct=True,
         )
 
-        if len(res.injected_node_ids) > 0:
-            clean_inj = res.x_injected_base[:, :atk.attack_dim]
-            adv_inj = res.x_adv[res.injected_node_ids, :atk.attack_dim]
-            delta_inj = (adv_inj - clean_inj).float()
-            per_node_l2 = torch.linalg.vector_norm(delta_inj, ord=2, dim=1)
-            pert_l2_mean = float(per_node_l2.mean().item())
-            pert_l2_n = int(per_node_l2.numel())
-            avg_perturbation = float(delta_inj.abs().mean().item())
-            avg_perturbation_signed = float(delta_inj.mean().item())
-            pooled_injected_l2.append(per_node_l2.detach().cpu())
-            pooled_injected_abs.append(delta_inj.abs().reshape(-1).detach().cpu())
-            pooled_injected_signed.append(delta_inj.reshape(-1).detach().cpu())
-        else:
-            pert_l2_mean, pert_l2_n = 0.0, 0
-            avg_perturbation = 0.0
-            avg_perturbation_signed = 0.0
+        pert_dim = int(info["perturbable_dim"])
+        clean_rows = x[targets, :pert_dim]
+        adv_rows = x_adv[targets, :pert_dim]
+        pred_clean_targets = pred_clean[targets]
+        pred_adv_targets = pred_adv[targets]
+        y_targets = y[targets].long()
+        pert_l2_mean, pert_l2_n = mean_perturbation_l2_on_success(
+            clean_rows, adv_rows, pred_clean_targets, pred_adv_targets, y_targets,
+        )
+        success_mask_targets = (pred_clean_targets == y_targets) & (pred_adv_targets != y_targets)
+        if int(success_mask_targets.sum().item()) > 0:
+            pooled_delta_success.append(
+                (adv_rows[success_mask_targets].float() - clean_rows[success_mask_targets].float()).detach().cpu()
+            )
 
         f1_pos_drop = float(clean_m["f1_pos"] - adv_m["f1_pos"])
         recall_pos_drop = float(clean_m["recall_pos"] - adv_m["recall_pos"])
@@ -277,8 +309,8 @@ def main():
             "t": t,
             "n_labeled": int(y_lab.numel()),
             "n_targets": int(targets.numel()),
-            "n_injected_nodes": len(res.injected_node_ids),
-            "edges_added": len(res.injected_edges),
+            "n_unique_edges_added": int(info["n_unique_edges_added"]),
+            "n_directed_edges_added": int(info["n_directed_edges_added"]),
             "asr": asr, "asr_success": ns, "asr_attempted": na,
             "asr_pos": asr_p, "asr_pos_success": sp, "asr_pos_attempted": ap,
             "asr_neg": asr_n, "asr_neg_success": sn, "asr_neg_attempted": an,
@@ -287,10 +319,7 @@ def main():
             "recall_pos_clean": clean_m["recall_pos"], "recall_pos_adv": adv_m["recall_pos"], "recall_pos_drop": recall_pos_drop,
             "roc_auc_clean": roc_clean, "roc_auc_adv": roc_adv,
             "mean_confidence_drop": conf_drop, "conf_drop_n": n_used,
-            "perturbation_l2_on_injected_nodes": pert_l2_mean,
-            "perturbation_l2_n_injected_nodes": pert_l2_n,
-            "avg_perturbation": avg_perturbation,
-            "avg_perturbation_signed": avg_perturbation_signed,
+            "pert_l2_success": pert_l2_mean, "pert_l2_n": pert_l2_n,
         })
 
         pooled_y_true.append(y_lab.detach().cpu())
@@ -304,7 +333,8 @@ def main():
         roc_a_show = roc_adv if roc_adv == roc_adv else float("nan")
         print(
             f"t={t:2d}  n_labeled={y_lab.numel():5d}  n_targets={targets.numel():4d}  "
-            f"ASR={asr:.4f} ({ns}/{na})  F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
+            f"edges+={info['n_unique_edges_added']:3d}  ASR={asr:.4f} ({ns}/{na})  "
+            f"F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
             f"ROC {roc_c_show:.3f}->{roc_a_show:.3f}"
         )
 
@@ -327,28 +357,24 @@ def main():
 
         asr_c, ns_c, na_c = attack_success_rate(y_true, pred_clean_c, pred_adv_c, attack_mask_c)
         asr_cp, sp_c, ap_c, asr_cn, sn_c, an_c = asr_pos_neg(y_true, logits_clean_c, logits_adv_c, attack_mask_c)
-
         conf_drop_c, conf_drop_n_c = mean_confidence_drop(
-            y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True
+            y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True,
         )
 
-        if pooled_injected_l2:
-            pert_l2_c = float(torch.cat(pooled_injected_l2).mean().item())
-            pert_l2_n_c = int(torch.cat(pooled_injected_l2).numel())
-            avg_perturbation_c = float(torch.cat(pooled_injected_abs).mean().item())
-            avg_perturbation_signed_c = float(torch.cat(pooled_injected_signed).mean().item())
+        if pooled_delta_success:
+            delta_all = torch.cat(pooled_delta_success, dim=0)
+            pert_l2_c = float(torch.linalg.vector_norm(delta_all, ord=2, dim=1).mean().item())
+            pert_l2_n_c = int(delta_all.size(0))
         else:
             pert_l2_c, pert_l2_n_c = 0.0, 0
-            avg_perturbation_c, avg_perturbation_signed_c = 0.0, 0.0
-
-        f1_pos_drop_c = float(clean_c["f1_pos"] - adv_c["f1_pos"])
-        recall_pos_drop_c = float(clean_c["recall_pos"] - adv_c["recall_pos"])
 
         concat_classification = {
             "n_total": int(y_true.numel()),
-            "f1_pos_clean": clean_c["f1_pos"], "f1_pos_adv": adv_c["f1_pos"], "f1_pos_drop": f1_pos_drop_c,
+            "f1_pos_clean": clean_c["f1_pos"], "f1_pos_adv": adv_c["f1_pos"],
+            "f1_pos_drop": float(clean_c["f1_pos"] - adv_c["f1_pos"]),
             "f1_macro_clean": clean_c["f1_macro"], "f1_macro_adv": adv_c["f1_macro"],
-            "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"], "recall_pos_drop": recall_pos_drop_c,
+            "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"],
+            "recall_pos_drop": float(clean_c["recall_pos"] - adv_c["recall_pos"]),
             "roc_auc_clean": roc_c_clean, "roc_auc_adv": roc_c_adv,
         }
         concat_attack = {
@@ -357,50 +383,28 @@ def main():
             "asr_pos": asr_cp, "asr_pos_success": sp_c, "asr_pos_attempted": ap_c,
             "asr_neg": asr_cn, "asr_neg_success": sn_c, "asr_neg_attempted": an_c,
             "mean_confidence_drop": conf_drop_c, "conf_drop_n": conf_drop_n_c,
-            "perturbation_l2_on_injected_nodes": pert_l2_c,
-            "perturbation_l2_n_injected_nodes": pert_l2_n_c,
-            "avg_perturbation": avg_perturbation_c,
-            "avg_perturbation_signed": avg_perturbation_signed_c,
+            "pert_l2_success": pert_l2_c, "pert_l2_n": pert_l2_n_c,
+            "n_unique_edges_added_total": n_unique_added_total,
+            "n_targets_with_edge_added_total": n_targets_with_edge_total,
         }
 
     print()
-    # print(
-    #     f"NodeInjection RecGNN | n_inject={N_INJECT} edges_per_injected={EDGES_PER_INJECTED} "
-    #     f"eps={EPS} alpha={ALPHA} steps={STEPS} random_start={RANDOM_START} connect={CONNECT_STRATEGY}"
-    # )
-    # print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
-    # if concat_classification is not None and concat_attack is not None:
-    #     print(f"[concatenated across all test timesteps, n={concat_classification['n_total']}]")
-    #     print(
-    #         f"  ASR     : {concat_attack['asr']:.4f} "
-    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-    #     )
-    #     print(
-    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-    #     )
-    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-    # print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
-
     run_dir, ts = make_run_dir(MODEL_NAME)
     config = {
         "timestamp": ts,
-        "attack": "NodeInjectionEvasion",
+        "attack": "AdaptedNETTACK",
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
         "dataset": DATASET,
         "checkpoint_path": ckpt_path,
         "device": str(device),
         "attack_params": {
-            "n_inject": N_INJECT, "edges_per_injected": EDGES_PER_INJECTED,
-            "eps": EPS, "alpha": ALPHA, "steps": STEPS, "random_start": RANDOM_START,
-            "init": INIT, "clamp": CLAMP, "connect_strategy": CONNECT_STRATEGY,
+            "n_struct": N_STRUCT, "eps_feat": EPS_FEAT, "clamp": CLAMP,
+            "d_min": D_MIN, "chi2_tau": CHI2_TAU,
+            "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "surrogate_epochs": SURROGATE_EPOCHS,
+            "surrogate_lr": SURROGATE_LR,
+            "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
             "attack_dim": attack_dim,
         },
         "target_selection": {
@@ -415,7 +419,7 @@ def main():
     write_json(os.path.join(run_dir, "config.json"), config)
 
     metrics = {
-        "attack": "NodeInjectionEvasion",
+        "attack": "AdaptedNETTACK",
         "model_name": MODEL_NAME,
         "dataset": DATASET,
         "classification": {
@@ -425,10 +429,6 @@ def main():
         "attack_effect": {
             "attack_time_seconds": attack_time_seconds,
             "aggregate_concat": concat_attack,
-        },
-        "injection": {
-            "total_injected_nodes": total_injected_nodes,
-            "total_edges_added": total_edges_added,
         },
         "per_timestep": per_timestep,
     }

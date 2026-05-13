@@ -156,6 +156,9 @@ def main():
     pooled_logits_clean = []
     pooled_logits_adv = []
     pooled_attack_mask = []
+    pooled_injected_l2 = []
+    pooled_injected_abs = []
+    pooled_injected_signed = []
     total_injected_nodes = 0
     total_edges_added = 0
     attack_time_seconds = 0.0
@@ -232,6 +235,23 @@ def main():
             label_vals, logits_clean, logits_adv, attack_mask, only_clean_correct=True
         )
 
+        if len(res.injected_node_ids) > 0:
+            clean_inj = res.x_injected_base[:, attack_start_col:]
+            adv_inj = res.hist_ndFeats_list[-1][res.injected_node_ids, attack_start_col:]
+            delta_inj = (adv_inj - clean_inj).float()
+            per_node_l2 = torch.linalg.vector_norm(delta_inj, ord=2, dim=1)
+            pert_l2_mean = float(per_node_l2.mean().item())
+            pert_l2_n = int(per_node_l2.numel())
+            avg_perturbation = float(delta_inj.abs().mean().item())
+            avg_perturbation_signed = float(delta_inj.mean().item())
+            pooled_injected_l2.append(per_node_l2.detach().cpu())
+            pooled_injected_abs.append(delta_inj.abs().reshape(-1).detach().cpu())
+            pooled_injected_signed.append(delta_inj.reshape(-1).detach().cpu())
+        else:
+            pert_l2_mean, pert_l2_n = 0.0, 0
+            avg_perturbation = 0.0
+            avg_perturbation_signed = 0.0
+
         f1_pos_drop = float(clean_m["f1_pos"] - adv_m["f1_pos"])
         recall_pos_drop = float(clean_m["recall_pos"] - adv_m["recall_pos"])
 
@@ -249,6 +269,10 @@ def main():
             "recall_pos_clean": clean_m["recall_pos"], "recall_pos_adv": adv_m["recall_pos"], "recall_pos_drop": recall_pos_drop,
             "roc_auc_clean": roc_clean, "roc_auc_adv": roc_adv,
             "mean_confidence_drop": conf_drop, "conf_drop_n": n_used,
+            "perturbation_l2_on_injected_nodes": pert_l2_mean,
+            "perturbation_l2_n_injected_nodes": pert_l2_n,
+            "avg_perturbation": avg_perturbation,
+            "avg_perturbation_signed": avg_perturbation_signed,
         })
 
         pooled_y_true.append(label_vals.detach().cpu())
@@ -290,6 +314,15 @@ def main():
             y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True
         )
 
+        if pooled_injected_l2:
+            pert_l2_c = float(torch.cat(pooled_injected_l2).mean().item())
+            pert_l2_n_c = int(torch.cat(pooled_injected_l2).numel())
+            avg_perturbation_c = float(torch.cat(pooled_injected_abs).mean().item())
+            avg_perturbation_signed_c = float(torch.cat(pooled_injected_signed).mean().item())
+        else:
+            pert_l2_c, pert_l2_n_c = 0.0, 0
+            avg_perturbation_c, avg_perturbation_signed_c = 0.0, 0.0
+
         f1_pos_drop_c = float(clean_c["f1_pos"] - adv_c["f1_pos"])
         recall_pos_drop_c = float(clean_c["recall_pos"] - adv_c["recall_pos"])
 
@@ -306,6 +339,10 @@ def main():
             "asr_pos": asr_cp, "asr_pos_success": sp_c, "asr_pos_attempted": ap_c,
             "asr_neg": asr_cn, "asr_neg_success": sn_c, "asr_neg_attempted": an_c,
             "mean_confidence_drop": conf_drop_c, "conf_drop_n": conf_drop_n_c,
+            "perturbation_l2_on_injected_nodes": pert_l2_c,
+            "perturbation_l2_n_injected_nodes": pert_l2_n_c,
+            "avg_perturbation": avg_perturbation_c,
+            "avg_perturbation_signed": avg_perturbation_signed_c,
         }
 
     print()
