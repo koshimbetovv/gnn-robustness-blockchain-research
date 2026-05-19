@@ -13,6 +13,7 @@ from src.datasets.recgnn_ellipticpp_actors import (
 )
 from src.attacks.node_injection_recgnn import RecGNNNodeInjectionAttack
 from src.utils.model_loader import load_model
+from src.utils.seed import set_seed
 from src.training.metrics import (
     binary_classification_metrics, attack_success_rate, roc_auc_binary,
     mean_confidence_drop, asr_pos_neg,
@@ -34,7 +35,7 @@ EPS = 0.05
 ALPHA = 0.01
 STEPS = 30
 RANDOM_START = True
-INIT = "mean"
+INIT = "randn"
 CLAMP = None
 CONNECT_STRATEGY = "round_robin"
 # Number of local (controllable) feature columns. The trailing 2 ANF columns
@@ -96,8 +97,50 @@ def pick_targets_graph(
     return idx[perm[:n].to(idx.device)]
 
 
+def sample_injection_schedule(
+    eligible_timesteps: list[int],
+    timestep_capacity: dict[int, int],
+    n_inject: int,
+    seed: int,
+):
+    """Sample a feasible sequence-wide node budget allocation over eligible timesteps."""
+    if n_inject <= 0 or not eligible_timesteps:
+        return [], {}
+
+    remaining = {
+        int(t): int(timestep_capacity[int(t)])
+        for t in eligible_timesteps
+        if int(timestep_capacity.get(int(t), 0)) > 0
+    }
+    total_capacity = int(sum(remaining.values()))
+    if total_capacity < int(n_inject):
+        raise ValueError(
+            f"Global injection budget N_INJECT={int(n_inject)} is infeasible for RecGNN: "
+            f"total available timestep capacity is {total_capacity}. Reduce N_INJECT "
+            f"or use a model/checkpoint with larger m-LSTM state_rows."
+        )
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+
+    sampled_timesteps: list[int] = []
+    allocation = {int(t): 0 for t in eligible_timesteps}
+    for _ in range(int(n_inject)):
+        choices = sorted(remaining)
+        draw = int(torch.randint(len(choices), (1,), generator=g).item())
+        t = int(choices[draw])
+        sampled_timesteps.append(t)
+        allocation[t] += 1
+        remaining[t] -= 1
+        if remaining[t] <= 0:
+            del remaining[t]
+
+    return sampled_timesteps, allocation
+
+
 def main():
     device = get_device()
+    set_seed(SEED, deterministic=True, benchmark=False)
 
     from src.utils.model_loader import resolve_checkpoint
     ckpt_path, ckpt_run_dir = resolve_checkpoint(MODEL_NAME, model_dir=MODEL_DIR, run_id=RUN_ID)
@@ -131,6 +174,52 @@ def main():
     print("Priming sequence state over train graphs ...")
     atk.prime(sequence.train_graphs)
 
+    print("Planning clean test trajectory and sampling global injection schedule ...")
+    planned_targets: dict[int, torch.Tensor] = {}
+    eligible_timesteps: list[int] = []
+    timestep_capacity: dict[int, int] = {}
+    state_rows = int(model.m_lstm.state_rows)
+    for graph in sequence.test_graphs:
+        g = graph.to(device)
+        x = g.x.float()
+        edge_index = g.edge_index.long()
+        y = g.y
+        t = int(g.graph_timestep)
+        timestep_capacity[t] = max(0, state_rows - int(x.size(0)))
+
+        with torch.no_grad():
+            log_probs_preview = atk._forward(x, edge_index).detach()
+            model.detach_sequence_state()
+        pred_preview = log_probs_preview.argmax(dim=1)
+
+        labeled_mask = y != -1
+        if int(labeled_mask.sum().item()) == 0:
+            planned_targets[t] = torch.empty(0, dtype=torch.long)
+            continue
+
+        targets = pick_targets_graph(
+            y, pred_preview,
+            only_illicit=ATTACK_ONLY_ILLICIT,
+            only_clean_correct=ONLY_CLEAN_CORRECT,
+            fraction=ATTACK_FRACTION,
+            seed=SEED + t,
+        )
+        planned_targets[t] = targets.detach().cpu()
+        if targets.numel() > 0 and timestep_capacity[t] > 0:
+            eligible_timesteps.append(t)
+
+    sampled_injection_timesteps, injection_allocation = sample_injection_schedule(
+        eligible_timesteps, timestep_capacity, N_INJECT, SEED
+    )
+    print(
+        f"Eligible attack timesteps: {len(eligible_timesteps)} | "
+        f"sampled injections: {len(sampled_injection_timesteps)} | "
+        f"total capacity: {sum(timestep_capacity.get(t, 0) for t in eligible_timesteps)}"
+    )
+
+    print("Replaying test trajectory with the sampled global injection schedule ...")
+    atk.prime(sequence.train_graphs)
+
     per_timestep = []
     pooled_y_true = []
     pooled_pred_clean = []
@@ -151,6 +240,7 @@ def main():
         edge_index = g.edge_index.long()
         y = g.y
         t = int(g.graph_timestep)
+        assigned_n_inject = int(injection_allocation.get(t, 0))
 
         labeled_mask = y != -1
         if int(labeled_mask.sum().item()) == 0:
@@ -158,35 +248,29 @@ def main():
                 x, edge_index,
                 torch.empty(0, dtype=torch.long, device=device),
                 torch.empty(0, dtype=torch.long, device=device),
-                n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
+                n_inject=0, edges_per_injected=EDGES_PER_INJECTED,
                 eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
                 init=INIT, connect_strategy=CONNECT_STRATEGY,
             )
-            per_timestep.append({"t": t, "n_labeled": 0, "n_targets": 0, "skipped": True})
+            per_timestep.append({
+                "t": t,
+                "n_labeled": 0,
+                "n_targets_available": 0,
+                "n_targets_attacked": 0,
+                "n_injected_nodes_budgeted": assigned_n_inject,
+                "n_injected_nodes": 0,
+                "skipped": True,
+            })
             continue
 
-        # Clean preview to pick targets without disturbing sequence state.
-        snap = atk._save_state()
-        with torch.no_grad():
-            log_probs_preview = atk._forward(x, edge_index).detach()
-            model.detach_sequence_state()
-        atk._restore_state(snap)
-        pred_preview = log_probs_preview.argmax(dim=1)
+        targets = planned_targets.get(t, torch.empty(0, dtype=torch.long)).to(device)
 
-        targets = pick_targets_graph(
-            y, pred_preview,
-            only_illicit=ATTACK_ONLY_ILLICIT,
-            only_clean_correct=ONLY_CLEAN_CORRECT,
-            fraction=ATTACK_FRACTION,
-            seed=SEED + t,
-        )
-
-        if targets.numel() == 0:
+        if targets.numel() == 0 or assigned_n_inject == 0:
             res = atk.attack_step(
                 x, edge_index,
                 torch.empty(0, dtype=torch.long, device=device),
                 torch.empty(0, dtype=torch.long, device=device),
-                n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
+                n_inject=0, edges_per_injected=EDGES_PER_INJECTED,
                 eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
                 init=INIT, connect_strategy=CONNECT_STRATEGY,
             )
@@ -194,7 +278,10 @@ def main():
             per_timestep.append({
                 "t": t,
                 "n_labeled": int(labeled_mask.sum().item()),
-                "n_targets": 0,
+                "n_targets_available": int(targets.numel()),
+                "n_targets_attacked": 0,
+                "n_injected_nodes_budgeted": assigned_n_inject,
+                "n_injected_nodes": 0,
                 "skipped": True,
             })
             pooled_y_true.append(y[labeled_mask].detach().cpu())
@@ -219,7 +306,7 @@ def main():
         t0 = time.perf_counter()
         res = atk.attack_step(
             x, edge_index, targets, labels_true,
-            n_inject=N_INJECT, edges_per_injected=EDGES_PER_INJECTED,
+            n_inject=assigned_n_inject, edges_per_injected=EDGES_PER_INJECTED,
             eps=EPS, alpha=ALPHA, steps=STEPS, random_start=RANDOM_START,
             init=INIT, reference_nodes=init_reference, connect_strategy=CONNECT_STRATEGY,
         )
@@ -276,7 +363,9 @@ def main():
         per_timestep.append({
             "t": t,
             "n_labeled": int(y_lab.numel()),
-            "n_targets": int(targets.numel()),
+            "n_targets_available": int(targets.numel()),
+            "n_targets_attacked": int(targets.numel()),
+            "n_injected_nodes_budgeted": assigned_n_inject,
             "n_injected_nodes": len(res.injected_node_ids),
             "edges_added": len(res.injected_edges),
             "asr": asr, "asr_success": ns, "asr_attempted": na,
@@ -351,8 +440,16 @@ def main():
             "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"], "recall_pos_drop": recall_pos_drop_c,
             "roc_auc_clean": roc_c_clean, "roc_auc_adv": roc_c_adv,
         }
+        n_targets_available_total = int(sum(item.get("n_targets_available", 0) for item in per_timestep))
+        n_targets_attacked_total = int(attack_mask_c.sum().item())
+        n_eligible_timesteps = int(sum(1 for item in per_timestep if item.get("n_targets_available", 0) > 0))
+        n_budgeted_timesteps = int(sum(1 for item in per_timestep if item.get("n_injected_nodes_budgeted", 0) > 0))
         concat_attack = {
-            "n_targets_total": int(attack_mask_c.sum().item()),
+            "n_targets_available_total": n_targets_available_total,
+            "n_targets_attacked_total": n_targets_attacked_total,
+            "n_targets_total": n_targets_attacked_total,
+            "n_eligible_timesteps": n_eligible_timesteps,
+            "n_budgeted_timesteps": n_budgeted_timesteps,
             "asr": asr_c, "asr_success": ns_c, "asr_attempted": na_c,
             "asr_pos": asr_cp, "asr_pos_success": sp_c, "asr_pos_attempted": ap_c,
             "asr_neg": asr_cn, "asr_neg_success": sn_c, "asr_neg_attempted": an_c,
@@ -402,6 +499,8 @@ def main():
             "eps": EPS, "alpha": ALPHA, "steps": STEPS, "random_start": RANDOM_START,
             "init": INIT, "clamp": CLAMP, "connect_strategy": CONNECT_STRATEGY,
             "attack_dim": attack_dim,
+            "budget_mode": "global_sequence",
+            "persistence": "non_persistent",
         },
         "target_selection": {
             "attack_only_illicit": ATTACK_ONLY_ILLICIT,
@@ -411,6 +510,18 @@ def main():
         },
         "data": ckpt_cfg["data"],
         "model_hparams": ckpt_cfg["model"],
+        "injection_schedule": {
+            "eligible_timesteps": eligible_timesteps,
+            "sampled_timesteps": sampled_injection_timesteps,
+            "timestep_capacity": [
+                {"t": int(t), "capacity": int(timestep_capacity[t])}
+                for t in sorted(timestep_capacity)
+            ],
+            "allocation_by_timestep": [
+                {"t": int(t), "n_inject": int(injection_allocation[t])}
+                for t in sorted(injection_allocation)
+            ],
+        },
     }
     write_json(os.path.join(run_dir, "config.json"), config)
 
@@ -429,6 +540,20 @@ def main():
         "injection": {
             "total_injected_nodes": total_injected_nodes,
             "total_edges_added": total_edges_added,
+            "budget_mode": "global_sequence",
+            "n_inject_total_budget": int(N_INJECT),
+            "n_targets_available_total": int(sum(item.get("n_targets_available", 0) for item in per_timestep)),
+            "n_targets_attacked_total": int(sum(item.get("n_targets_attacked", 0) for item in per_timestep)),
+            "eligible_timesteps": eligible_timesteps,
+            "sampled_timesteps": sampled_injection_timesteps,
+            "timestep_capacity": [
+                {"t": int(t), "capacity": int(timestep_capacity[t])}
+                for t in sorted(timestep_capacity)
+            ],
+            "allocation_by_timestep": [
+                {"t": int(t), "n_inject": int(injection_allocation[t])}
+                for t in sorted(injection_allocation)
+            ],
         },
         "per_timestep": per_timestep,
     }

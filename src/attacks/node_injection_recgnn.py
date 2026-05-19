@@ -66,6 +66,32 @@ class RecGNNNodeInjectionAttack:
     def _forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         return self.model(x, edge_index)
 
+    @staticmethod
+    def _dedupe_targets_with_labels(
+        target_nodes: torch.Tensor,
+        labels_true: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Drop duplicate targets while preserving the caller's original order."""
+        target_nodes = target_nodes.view(-1)
+        if target_nodes.numel() == 0:
+            return target_nodes, labels_true
+
+        keep_pos: list[int] = []
+        seen: set[int] = set()
+        for pos, node_id in enumerate(target_nodes.detach().cpu().tolist()):
+            if int(node_id) in seen:
+                continue
+            seen.add(int(node_id))
+            keep_pos.append(pos)
+
+        keep_idx = torch.tensor(keep_pos, dtype=torch.long, device=target_nodes.device)
+        target_nodes = target_nodes[keep_idx]
+
+        if labels_true is None:
+            return target_nodes, None
+        labels_true = labels_true.view(-1)[keep_idx]
+        return target_nodes, labels_true
+
     def _save_state(self):
         ml = self.model.m_lstm
         ev = ml.cell.evolve_linear
@@ -200,7 +226,8 @@ class RecGNNNodeInjectionAttack:
         index space as `log_probs_clean`.
         """
         target_nodes = target_nodes.to(self.device).long().view(-1)
-        target_nodes = torch.unique(target_nodes)
+        labels_true = labels_true.to(self.device).long().view(-1)
+        target_nodes, labels_true = self._dedupe_targets_with_labels(target_nodes, labels_true)
         n_existing = int(x.size(0))
 
         snap_pre = self._save_state()

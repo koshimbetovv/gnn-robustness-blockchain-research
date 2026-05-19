@@ -19,7 +19,7 @@ from src.training.metrics import (
 from src.utils.attack_targets import pick_target_nodes
 
 # ---------- attack parameters ----------
-MODEL_NAME = "gcn"
+MODEL_NAME = "chronowave_gnn"  # "gcn", "graphsage", "gat", "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)

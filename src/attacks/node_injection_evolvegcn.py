@@ -56,6 +56,32 @@ class EvolveGCNNodeInjectionAttack:
     def forward_labels(self, hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx):
         return self._forward(hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx)
 
+    @staticmethod
+    def _dedupe_targets_with_labels(
+        target_nodes: torch.Tensor,
+        labels_true: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Drop duplicate targets while preserving the caller's original order."""
+        target_nodes = target_nodes.view(-1)
+        if target_nodes.numel() == 0:
+            return target_nodes, labels_true
+
+        keep_pos: list[int] = []
+        seen: set[int] = set()
+        for pos, node_id in enumerate(target_nodes.detach().cpu().tolist()):
+            if int(node_id) in seen:
+                continue
+            seen.add(int(node_id))
+            keep_pos.append(pos)
+
+        keep_idx = torch.tensor(keep_pos, dtype=torch.long, device=target_nodes.device)
+        target_nodes = target_nodes[keep_idx]
+
+        if labels_true is None:
+            return target_nodes, None
+        labels_true = labels_true.view(-1)[keep_idx]
+        return target_nodes, labels_true
+
     def _init_injected_features(
         self,
         base_x: torch.Tensor,
@@ -205,7 +231,8 @@ class EvolveGCNNodeInjectionAttack:
         history steps remain unchanged in shape and content.
         """
         target_nodes = target_nodes.to(self.device).long().view(-1)
-        target_nodes = torch.unique(target_nodes)
+        labels_true = labels_true.to(self.device).long().view(-1)
+        target_nodes, labels_true = self._dedupe_targets_with_labels(target_nodes, labels_true)
 
         base_last = hist_ndFeats_list[-1]
         base_adj_last = hist_adj_list[-1]
