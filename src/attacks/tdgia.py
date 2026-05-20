@@ -54,15 +54,27 @@ class TDGIAAttack(BaseAttack):
             raise ValueError(f"attack_dim must be in [1, {self.x.size(1)}], got {self.attack_dim}")
         self.rebuild_fn = rebuild_fn
 
-    def _feature_range(self) -> tuple[float, float]:
+    def _feature_range(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.clamp is not None:
-            return float(self.clamp[0]), float(self.clamp[1])
-        xmin = float(self.x[:, : self.attack_dim].min().item())
-        xmax = float(self.x[:, : self.attack_dim].max().item())
-        if not torch.isfinite(torch.tensor([xmin, xmax])).all() or xmin == xmax:
-            pad = 1.0
-            return xmin - pad, xmax + pad
-        return xmin, xmax
+            feat_min = torch.full(
+                (self.attack_dim,), float(self.clamp[0]), device=self.device, dtype=self.x.dtype
+            )
+            feat_max = torch.full(
+                (self.attack_dim,), float(self.clamp[1]), device=self.device, dtype=self.x.dtype
+            )
+            return feat_min, feat_max
+
+        x_attack = self.x[:, : self.attack_dim]
+        feat_min = x_attack.min(dim=0).values
+        feat_max = x_attack.max(dim=0).values
+        invalid = (~torch.isfinite(feat_min)) | (~torch.isfinite(feat_max)) | (feat_min == feat_max)
+        if invalid.any():
+            feat_min = feat_min.clone()
+            feat_max = feat_max.clone()
+            center = torch.where(torch.isfinite(feat_min), feat_min, torch.zeros_like(feat_min))
+            feat_min[invalid] = center[invalid] - 1.0
+            feat_max[invalid] = center[invalid] + 1.0
+        return feat_min, feat_max
 
     def _init_injected_features(
         self,
@@ -71,8 +83,8 @@ class TDGIAAttack(BaseAttack):
         init: str = "randn",
         reference_nodes: Optional[torch.Tensor] = None,
         sigma_scale: float = 1.0,
-        feat_min: float,
-        feat_max: float,
+        feat_min: torch.Tensor,
+        feat_max: torch.Tensor,
     ) -> torch.Tensor:
         if reference_nodes is None or reference_nodes.numel() == 0:
             ref = self.x
@@ -105,15 +117,15 @@ class TDGIAAttack(BaseAttack):
         return x_full
 
     @staticmethod
-    def _smoothmap(latent: torch.Tensor, feat_min: float, feat_max: float) -> torch.Tensor:
+    def _smoothmap(latent: torch.Tensor, feat_min: torch.Tensor, feat_max: torch.Tensor) -> torch.Tensor:
         mid = 0.5 * (feat_max + feat_min)
         amp = 0.5 * (feat_max - feat_min)
         return mid + amp * torch.sin(latent)
 
     @staticmethod
-    def _inv_smoothmap(x: torch.Tensor, feat_min: float, feat_max: float) -> torch.Tensor:
+    def _inv_smoothmap(x: torch.Tensor, feat_min: torch.Tensor, feat_max: torch.Tensor) -> torch.Tensor:
         mid = 0.5 * (feat_max + feat_min)
-        amp = max(0.5 * (feat_max - feat_min), 1e-6)
+        amp = (0.5 * (feat_max - feat_min)).clamp_min(1e-6)
         scaled = ((x - mid) / amp).clamp(min=-0.999999, max=0.999999)
         return torch.asin(scaled)
 
@@ -201,19 +213,29 @@ class TDGIAAttack(BaseAttack):
         time_step_adv: Optional[torch.Tensor],
         target_nodes: torch.Tensor,
         surrogate_labels: torch.Tensor,
-        feat_min: float,
-        feat_max: float,
+        feat_min: torch.Tensor,
+        feat_max: torch.Tensor,
+        eps_feature: Optional[float],
         steps: int,
         lr: float,
         smooth_r: float,
     ) -> torch.Tensor:
-        latent = self._inv_smoothmap(base_inj[:, : self.attack_dim], feat_min, feat_max).detach()
+        if eps_feature is None:
+            opt_min = feat_min
+            opt_max = feat_max
+        else:
+            eps = float(eps_feature)
+            base_raw = base_inj[:, : self.attack_dim]
+            opt_min = torch.maximum(base_raw - eps, feat_min)
+            opt_max = torch.minimum(base_raw + eps, feat_max)
+
+        latent = self._inv_smoothmap(base_inj[:, : self.attack_dim], opt_min, opt_max).detach()
         latent.requires_grad_(True)
         opt = torch.optim.Adam([latent], lr=float(lr))
 
         for _ in range(int(steps)):
             opt.zero_grad()
-            raw_inj = self._smoothmap(latent, feat_min, feat_max)
+            raw_inj = self._smoothmap(latent, opt_min, opt_max)
             x_adv = self._apply_injected_raw(x_existing, raw_inj, base_inj)
             logits = forward_logits(self.model, x_adv, edge_index_adv, time_step=time_step_adv)
             probs = F.softmax(logits[target_nodes], dim=1)
@@ -222,7 +244,7 @@ class TDGIAAttack(BaseAttack):
             loss.backward()
             opt.step()
 
-        raw_final = self._smoothmap(latent.detach(), feat_min, feat_max)
+        raw_final = self._smoothmap(latent.detach(), opt_min, opt_max)
         return self._apply_injected_raw(x_existing, raw_final, base_inj).detach()
 
     def attack(
@@ -241,6 +263,7 @@ class TDGIAAttack(BaseAttack):
         init: str = "randn",
         reference_nodes: Optional[torch.Tensor] = None,
         sigma_scale: float = 1.0,
+        eps_feature: Optional[float] = None,
     ) -> TDGIAResult:
         if not torch.is_tensor(target_nodes):
             target_nodes = torch.tensor(target_nodes, dtype=torch.long)
@@ -278,6 +301,8 @@ class TDGIAAttack(BaseAttack):
         remaining = int(n_inject)
         batch_size = max(1, int(batch_size))
         degree_limit = max(1, int(degree_limit))
+        if eps_feature is not None and float(eps_feature) < 0.0:
+            raise ValueError(f"eps_feature must be non-negative or None, got {eps_feature}")
 
         while remaining > 0:
             bseq = min(batch_size, remaining)
@@ -327,6 +352,7 @@ class TDGIAAttack(BaseAttack):
                 surrogate_labels=surrogate_labels,
                 feat_min=feat_min,
                 feat_max=feat_max,
+                eps_feature=eps_feature,
                 steps=steps,
                 lr=lr,
                 smooth_r=smooth_r,

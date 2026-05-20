@@ -20,7 +20,7 @@ from src.utils.attack_targets import pick_target_nodes
 from src.utils.seed import set_seed
 
 # ---------- attack parameters ----------
-MODEL_NAME = "gcn"
+MODEL_NAME = "graphsage"  # "gcn", "graphsage", "gat", "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -29,6 +29,7 @@ DATASET = "elliptic"
 SPLIT = "test"
 
 # ---------- TDGIA hyperparameters ----------
+EPS_FEATURE = 0.05     # None -> no local feature budget; else constrain injected features to base +/- eps
 N_INJECT = 5
 DEGREE_LIMIT = 20
 BATCH_SIZE = 1
@@ -41,6 +42,7 @@ K2 = 1.0
 INIT = "randn"         # "zeros", "mean", "randn"
 SIGMA_SCALE = 1.0
 CLAMP = None           # None -> infer feature range from data; else e.g. (-3.0, 3.0)
+
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
@@ -150,6 +152,7 @@ def main():
         init=INIT,
         reference_nodes=init_reference,
         sigma_scale=SIGMA_SCALE,
+        eps_feature=EPS_FEATURE,
     )
     attack_time_seconds = float(time.perf_counter() - t_start)
 
@@ -215,6 +218,8 @@ def main():
             "init": INIT,
             "sigma_scale": SIGMA_SCALE,
             "clamp": CLAMP,
+            "eps_feature": EPS_FEATURE,
+            "feature_bounds": "manual_clamp" if CLAMP is not None else "per_feature_data_minmax",
             "surrogate": "victim_model",
         },
         "target_selection": {
