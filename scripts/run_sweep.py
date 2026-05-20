@@ -32,6 +32,18 @@ ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
         "evolvegcn_o": "scripts/run_node_injection_attack_evolvegcn.py",
         "cosemignn": "scripts/run_node_injection_attack_cosemignn.py",
     },
+    "adapted_nettack": {
+        "static": "scripts/run_adapted_nettack_attack.py",
+        "recgnn": "scripts/run_adapted_nettack_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_adapted_nettack_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_adapted_nettack_attack_cosemignn.py",
+    },
+    "tdgia": {
+        "static": "scripts/run_tdgia_attack.py",
+        "recgnn": "scripts/run_tdgia_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_tdgia_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_tdgia_attack_cosemignn.py",
+    },
     "monti": {
         "static": "scripts/run_monti_attack.py",
     },
