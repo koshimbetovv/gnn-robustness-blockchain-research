@@ -57,15 +57,3 @@ sweeps:
     - 2
     EPS:
     - 0.05
-- attack: nettack
-  params:
-    N_PERTURBATIONS:
-    - 2
-    - 5
-    SAMPLE_SIZE:
-    - 50
-    - 200
-    ATTACK_INCOMING:
-    - true
-    EARLY_STOP:
-    - true

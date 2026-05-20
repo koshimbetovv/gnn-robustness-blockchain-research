@@ -32,9 +32,6 @@ ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
         "evolvegcn_o": "scripts/run_node_injection_attack_evolvegcn.py",
         "cosemignn": "scripts/run_node_injection_attack_cosemignn.py",
     },
-    "nettack": {
-        "static": "scripts/run_nettack_attack.py",
-    },
     "monti": {
         "static": "scripts/run_monti_attack.py",
     },

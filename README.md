@@ -23,8 +23,7 @@ At the moment, the main supported dataset is **Elliptic** (Bitcoin transaction g
 
 ### Attacks (current status)
 Implemented:
-- `src/attacks/nettack_local.py` — **greedy targeted edge-addition** (samples candidate non-neighbors and adds the edge that maximizes CE loss on the target node).
-- `src/attacks/nettack.py` — a **toy NETTACK-style gradient attack** on a dense adjacency matrix (not scalable; toggles edges, so it may add/remove).
+- FGSM, PGD, node-injection, MonTi-style injection, and adapted NETTACK drivers under `scripts/` and `src/attacks/`.
 
 Placeholders (files exist but are currently empty):
 - `fgsm.py`, `pgd.py`, `random_edge_inject.py`, `random_node_inject.py`, `node_inject_plus_fgsm.py`
@@ -97,22 +96,6 @@ python scripts/evaluate_models.py
 
 Output figures are saved under `results/figures/`.
 
-## Adversarial attack demo (NETTACK-Local)
-
-A minimal usage pattern for `NettackLocalAttack` is shown in `src/main.py` (targeted attack on a single node).
-
-Key points:
-- Choose a **labeled** target node (`y != -1`).
-- The attack, as implemented, **adds edges only** (no deletions).
-
-If you want to run the demo, make sure the Elliptic raw CSVs exist under `data/raw/elliptic/`, then run:
-
-```bash
-python -m src.main
-```
-
-> `src/main.py` is a simple example entry point and may need small edits if you want a full “experiment runner” (the `config/experiments/` folder referenced in comments is not included).
-
 ## Checkpoints and outputs
 
 Training runs are saved as:
@@ -143,4 +126,3 @@ Useful scripts under `tools/`:
 ## Known gaps / TODOs
 - Most attacks (FGSM/PGD/random injections) are currently placeholders.
 - There is no unified “experiment runner” yet (training is script-based).
-

@@ -16,13 +16,6 @@ gnn-adversarial-blockchain/
 │   │   ├── gcn.yaml
 │   │   ├── gat.yaml
 │   │   └── graphsage.yaml
-│   ├── attacks/
-│   │   ├── nettack.yaml
-│   │   ├── fgsm.yaml                 # placeholder
-│   │   ├── pgd.yaml                  # placeholder
-│   │   ├── random_edge_inject.yaml   # placeholder
-│   │   ├── random_node_inject.yaml   # placeholder
-│   │   └── node_inject_plus_fgsm.yaml# placeholder
 │   └── datasets/
 │       └── elliptic.yaml             # placeholder
 ├── data/
@@ -50,8 +43,6 @@ gnn-adversarial-blockchain/
 │   │   └── metrics.py                # placeholder (empty)
 │   ├── attacks/
 │   │   ├── base_attack.py
-│   │   ├── nettack.py
-│   │   ├── nettack_local.py
 │   │   ├── fgsm.py                   # placeholder (empty)
 │   │   ├── pgd.py                    # placeholder (empty)
 │   │   ├── random_edge_inject.py     # placeholder (empty)
@@ -90,7 +81,6 @@ YAML configs. In the current state of the repo, most *training* scripts use in-f
 
 Subfolders:
 - `config/models/*.yaml` — model hyperparameters (hidden size, dropout, heads, etc.).
-- `config/attacks/*.yaml` — attack hyperparameters (mostly placeholders right now).
 - `config/datasets/*.yaml` — dataset-related configs (currently placeholder).
 
 ## `data/`
@@ -140,21 +130,12 @@ The “library” code.
 
 ### `src/attacks/`
 - `base_attack.py` — attack interface.
-- `nettack_local.py` — greedy targeted **edge-addition** attack.
-- `nettack.py` — toy gradient-based attack on dense adjacency (not scalable; toggles edges).
-- other files are placeholders (currently empty).
+- attack implementations for FGSM, PGD, node injection, MonTi/TDGIA-style injection, and adapted NETTACK.
 
 ### `src/utils/`
 - `model_loader.py` — checkpoint discovery and model reconstruction; provides `load_model()` / `load_all_models()`.
 - `graph_utils.py` — utilities (currently only `edge_index_to_adj`).
 - `seed.py`, `logging.py` — shared utilities for reproducibility and run metadata/logging.
-
-### `src/main.py`
-A minimal demo showing:
-1) training a GCN,
-2) evaluating clean accuracy,
-3) applying a targeted Nettack-Local structural attack,
-4) evaluating adversarial accuracy.
 
 ## `tools/`
 Debug / diagnostics scripts.

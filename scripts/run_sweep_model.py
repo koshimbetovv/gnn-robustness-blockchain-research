@@ -11,7 +11,6 @@ import yaml
 ATTACK_TO_SCRIPT = {
     "fgsm": "scripts/run_fgsm_attack.py",
     "pgd": "scripts/run_pgd_attack.py",
-    "nettack": "scripts/run_nettack_attack.py",
     "node_injection": "scripts/run_node_injection_attack.py",
     "monti": "scripts/run_monti_attack.py",
 }
@@ -173,9 +172,6 @@ def main():
         if attack not in modules:
             raise ValueError(f"Unknown attack '{attack}'")
         
-        if attack == 'nettack':
-            g_attack_fraction = 0.2
-
         param_grid = sweep.get("params", {}) or {}
         combos = cartesian(param_grid)
 

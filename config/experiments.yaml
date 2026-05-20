@@ -18,15 +18,6 @@ sweeps:
       ALPHA: ["auto"]     # auto => 2*eps/steps
       RANDOM_START: [true]
 
-  - attack: nettack
-    params:
-      N_PERTURBATIONS: [1, 3, 5]
-      SAMPLE_SIZE: [50, 200]
-      ATTACK_INCOMING: [true]
-      EARLY_STOP: [true]
-      ATTACK_ONLY_ILLICIT: [true]
-      ATTACK_FRACTION: [0.001]
-
   - attack: node_injection
     params:
       N_INJECT: [1, 3]
