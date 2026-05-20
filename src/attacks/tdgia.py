@@ -97,7 +97,7 @@ class TDGIAAttack(BaseAttack):
             base = ref.mean(dim=0, keepdim=True).repeat(n_inject, 1)
         elif init == "randn":
             mu = ref.mean(dim=0, keepdim=True)
-            std = ref.std(dim=0, keepdim=True).clamp_min(1e-6)
+            std = ref.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
             base = mu + float(sigma_scale) * torch.randn((n_inject, self.x.size(1)), device=self.device) * std
         else:
             raise ValueError(f"Unknown init={init!r}")
@@ -241,7 +241,7 @@ class TDGIAAttack(BaseAttack):
             probs = F.softmax(logits[target_nodes], dim=1)
             pv = probs.gather(1, surrogate_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
             loss = torch.relu(float(smooth_r) + torch.log(pv)).pow(2).mean()
-            loss.backward()
+            latent.grad = torch.autograd.grad(loss, latent, retain_graph=False, create_graph=False)[0]
             opt.step()
 
         raw_final = self._smoothmap(latent.detach(), opt_min, opt_max)
@@ -301,6 +301,8 @@ class TDGIAAttack(BaseAttack):
         remaining = int(n_inject)
         batch_size = max(1, int(batch_size))
         degree_limit = max(1, int(degree_limit))
+        if int(steps) < 0:
+            raise ValueError(f"steps must be non-negative, got {steps}")
         if eps_feature is not None and float(eps_feature) < 0.0:
             raise ValueError(f"eps_feature must be non-negative or None, got {eps_feature}")
 
