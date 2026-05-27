@@ -35,7 +35,7 @@ SPLIT = "test"
 #   N_STRUCT  : maximum number of edge ADDITIONS per target (no deletions).
 #   EPS_FEAT  : per-target L2 budget for the closed-form continuous feature step.
 #   CLAMP     : optional [lo, hi] clip applied to the final x_adv (e.g. (-3.0, 3.0)).
-N_STRUCT = 2
+N_STRUCT = 5
 EPS_FEAT = 0.05
 CLAMP = None
 
