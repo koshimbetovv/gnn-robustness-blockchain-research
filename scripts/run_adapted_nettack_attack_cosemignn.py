@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.datasets.cosemignn_elliptic import load_cosemignn_elliptic
 from src.datasets.cosemignn_ellipticpp_addraddr import load_cosemignn_ellipticpp_addraddr
 from src.attacks.nettack_adapted_temporal import (
-    AdaptedNettackTemporalAttack, train_surrogate_on_train_slices,
+    AdaptedNettackTemporalAttack, linearized_surrogate_logits,
+    train_surrogate_on_train_slices,
 )
 from src.utils.model_loader import resolve_checkpoint
 from src.utils.seed import set_seed
@@ -50,7 +51,7 @@ SURROGATE_WEIGHT_DECAY = 5e-4
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
 ATTACK_FRACTION = 1.0
-ONLY_CLEAN_CORRECT = True
+ONLY_CLEAN_CORRECT = False
 SEED = 0
 
 VERBOSE = False
@@ -207,6 +208,10 @@ def main():
     pooled_logits_clean = []
     pooled_logits_adv = []
     pooled_attack_mask = []
+    pooled_surrogate_pred_clean = []
+    pooled_surrogate_pred_adv = []
+    pooled_surrogate_logits_clean = []
+    pooled_surrogate_logits_adv = []
     pooled_delta_success = []
     n_unique_added_total = 0
     n_targets_with_edge_total = 0
@@ -227,7 +232,9 @@ def main():
 
         with torch.no_grad():
             logits_clean = cosemi_forward_logits(model, features, adj, ca_weights).detach()
+            logits_surrogate_clean = linearized_surrogate_logits(features.float(), adj.long(), W)
         pred_clean = logits_clean.argmax(dim=1)
+        pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
 
         # Pick targets among labeled positions.
         idx = torch.arange(labels.numel(), device=device)
@@ -235,7 +242,7 @@ def main():
         if ATTACK_ONLY_ILLICIT:
             idx = idx[labels[idx] == 1]
         if ONLY_CLEAN_CORRECT and idx.numel() > 0:
-            idx = idx[pred_clean[idx] == labels[idx]]
+            idx = idx[pred_surrogate_clean[idx] == labels[idx]]
 
         if idx.numel() == 0:
             per_slice.append({"t": t, "n_labeled": int(labels.numel()), "n_targets": 0, "skipped": True})
@@ -245,6 +252,10 @@ def main():
             pooled_logits_clean.append(logits_clean.detach().cpu())
             pooled_logits_adv.append(logits_clean.detach().cpu())
             pooled_attack_mask.append(torch.zeros(labels.numel(), dtype=torch.bool))
+            pooled_surrogate_pred_clean.append(pred_surrogate_clean.detach().cpu())
+            pooled_surrogate_pred_adv.append(pred_surrogate_clean.detach().cpu())
+            pooled_surrogate_logits_clean.append(logits_surrogate_clean.detach().cpu())
+            pooled_surrogate_logits_adv.append(logits_surrogate_clean.detach().cpu())
             continue
 
         if 0.0 < float(ATTACK_FRACTION) < 1.0:
@@ -267,19 +278,29 @@ def main():
 
         with torch.no_grad():
             logits_adv = cosemi_forward_logits(model, x_adv, edge_index_adv, ca_weights).detach()
+            logits_surrogate_adv = linearized_surrogate_logits(x_adv, edge_index_adv, W)
         pred_adv = logits_adv.argmax(dim=1)
+        pred_surrogate_adv = logits_surrogate_adv.argmax(dim=1)
 
         attack_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=device)
         attack_mask[targets] = True
 
         asr, ns, na = attack_success_rate(labels, pred_clean, pred_adv, attack_mask)
         asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(labels, logits_clean, logits_adv, attack_mask)
+        surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
+            labels, pred_surrogate_clean, pred_surrogate_adv, attack_mask,
+        )
+        surrogate_asr_p, surrogate_sp, surrogate_ap, surrogate_asr_n, surrogate_sn, surrogate_an = asr_pos_neg(
+            labels, logits_surrogate_clean, logits_surrogate_adv, attack_mask,
+        )
 
         slice_mask = torch.ones(labels.numel(), dtype=torch.bool, device=device)
         roc_clean = roc_auc_binary(logits_clean, labels, slice_mask)
         roc_adv = roc_auc_binary(logits_adv, labels, slice_mask)
         clean_m = binary_classification_metrics(labels, pred_clean)
         adv_m = binary_classification_metrics(labels, pred_adv)
+        surrogate_clean_m = binary_classification_metrics(labels, pred_surrogate_clean)
+        surrogate_adv_m = binary_classification_metrics(labels, pred_surrogate_adv)
 
         conf_drop, n_used = mean_confidence_drop(
             labels, logits_clean, logits_adv, attack_mask, only_clean_correct=True,
@@ -301,6 +322,7 @@ def main():
 
         f1_pos_drop = float(clean_m["f1_pos"] - adv_m["f1_pos"])
         recall_pos_drop = float(clean_m["recall_pos"] - adv_m["recall_pos"])
+        surrogate_f1_pos_drop = float(surrogate_clean_m["f1_pos"] - surrogate_adv_m["f1_pos"])
 
         per_slice.append({
             "t": t,
@@ -317,6 +339,18 @@ def main():
             "roc_auc_clean": roc_clean, "roc_auc_adv": roc_adv,
             "mean_confidence_drop": conf_drop, "conf_drop_n": n_used,
             "pert_l2_success": pert_l2_mean, "pert_l2_n": pert_l2_n,
+            "surrogate_asr": surrogate_asr,
+            "surrogate_asr_success": surrogate_ns,
+            "surrogate_asr_attempted": surrogate_na,
+            "surrogate_asr_pos": surrogate_asr_p,
+            "surrogate_asr_pos_success": surrogate_sp,
+            "surrogate_asr_pos_attempted": surrogate_ap,
+            "surrogate_asr_neg": surrogate_asr_n,
+            "surrogate_asr_neg_success": surrogate_sn,
+            "surrogate_asr_neg_attempted": surrogate_an,
+            "surrogate_f1_pos_clean": surrogate_clean_m["f1_pos"],
+            "surrogate_f1_pos_adv": surrogate_adv_m["f1_pos"],
+            "surrogate_f1_pos_drop": surrogate_f1_pos_drop,
         })
 
         pooled_y_true.append(labels.detach().cpu())
@@ -325,6 +359,10 @@ def main():
         pooled_logits_clean.append(logits_clean.detach().cpu())
         pooled_logits_adv.append(logits_adv.detach().cpu())
         pooled_attack_mask.append(attack_mask.detach().cpu())
+        pooled_surrogate_pred_clean.append(pred_surrogate_clean.detach().cpu())
+        pooled_surrogate_pred_adv.append(pred_surrogate_adv.detach().cpu())
+        pooled_surrogate_logits_clean.append(logits_surrogate_clean.detach().cpu())
+        pooled_surrogate_logits_adv.append(logits_surrogate_adv.detach().cpu())
 
         roc_c_show = roc_clean if roc_clean == roc_clean else float("nan")
         roc_a_show = roc_adv if roc_adv == roc_adv else float("nan")
@@ -338,6 +376,8 @@ def main():
     # ---------- aggregation ----------
     concat_classification = None
     concat_attack = None
+    concat_surrogate_classification = None
+    concat_surrogate_attack = None
     if pooled_y_true:
         y_true = torch.cat(pooled_y_true)
         pred_clean_c = torch.cat(pooled_pred_clean)
@@ -345,6 +385,10 @@ def main():
         logits_clean_c = torch.cat(pooled_logits_clean)
         logits_adv_c = torch.cat(pooled_logits_adv)
         attack_mask_c = torch.cat(pooled_attack_mask)
+        pred_surrogate_clean_c = torch.cat(pooled_surrogate_pred_clean)
+        pred_surrogate_adv_c = torch.cat(pooled_surrogate_pred_adv)
+        logits_surrogate_clean_c = torch.cat(pooled_surrogate_logits_clean)
+        logits_surrogate_adv_c = torch.cat(pooled_surrogate_logits_adv)
 
         clean_c = binary_classification_metrics(y_true, pred_clean_c)
         adv_c = binary_classification_metrics(y_true, pred_adv_c)
@@ -354,6 +398,12 @@ def main():
 
         asr_c, ns_c, na_c = attack_success_rate(y_true, pred_clean_c, pred_adv_c, attack_mask_c)
         asr_cp, sp_c, ap_c, asr_cn, sn_c, an_c = asr_pos_neg(y_true, logits_clean_c, logits_adv_c, attack_mask_c)
+        surrogate_asr_c, surrogate_ns_c, surrogate_na_c = attack_success_rate(
+            y_true, pred_surrogate_clean_c, pred_surrogate_adv_c, attack_mask_c,
+        )
+        surrogate_asr_cp, surrogate_sp_c, surrogate_ap_c, surrogate_asr_cn, surrogate_sn_c, surrogate_an_c = asr_pos_neg(
+            y_true, logits_surrogate_clean_c, logits_surrogate_adv_c, attack_mask_c,
+        )
         conf_drop_c, conf_drop_n_c = mean_confidence_drop(
             y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True,
         )
@@ -384,6 +434,31 @@ def main():
             "n_unique_edges_added_total": n_unique_added_total,
             "n_targets_with_edge_added_total": n_targets_with_edge_total,
         }
+        surrogate_clean_c = binary_classification_metrics(y_true, pred_surrogate_clean_c)
+        surrogate_adv_c = binary_classification_metrics(y_true, pred_surrogate_adv_c)
+        concat_surrogate_classification = {
+            "n_total": int(y_true.numel()),
+            "f1_pos_clean": surrogate_clean_c["f1_pos"],
+            "f1_pos_adv": surrogate_adv_c["f1_pos"],
+            "f1_pos_drop": float(surrogate_clean_c["f1_pos"] - surrogate_adv_c["f1_pos"]),
+            "f1_macro_clean": surrogate_clean_c["f1_macro"],
+            "f1_macro_adv": surrogate_adv_c["f1_macro"],
+            "recall_pos_clean": surrogate_clean_c["recall_pos"],
+            "recall_pos_adv": surrogate_adv_c["recall_pos"],
+            "recall_pos_drop": float(surrogate_clean_c["recall_pos"] - surrogate_adv_c["recall_pos"]),
+        }
+        concat_surrogate_attack = {
+            "n_targets_total": int(attack_mask_c.sum().item()),
+            "asr": surrogate_asr_c,
+            "asr_success": surrogate_ns_c,
+            "asr_attempted": surrogate_na_c,
+            "asr_pos": surrogate_asr_cp,
+            "asr_pos_success": surrogate_sp_c,
+            "asr_pos_attempted": surrogate_ap_c,
+            "asr_neg": surrogate_asr_cn,
+            "asr_neg_success": surrogate_sn_c,
+            "asr_neg_attempted": surrogate_an_c,
+        }
 
     print()
     run_dir, ts = make_run_dir(MODEL_NAME)
@@ -406,6 +481,7 @@ def main():
         },
         "timesteps": {"predict_start": predict_start, "predict_end": predict_end},
         "target_selection": {
+            "model": "surrogate_linearized_gcn",
             "attack_only_illicit": ATTACK_ONLY_ILLICIT,
             "attack_fraction": ATTACK_FRACTION,
             "only_clean_correct": ONLY_CLEAN_CORRECT,
@@ -430,6 +506,15 @@ def main():
             "aggregate_concat": concat_attack,
         },
         "per_timestep": per_slice,
+        "surrogate": {
+            "classification": {
+                "scope": "temporal",
+                "aggregate_concat": concat_surrogate_classification,
+            },
+            "attack_effect": {
+                "aggregate_concat": concat_surrogate_attack,
+            },
+        },
     }
     write_json(os.path.join(run_dir, "metrics.json"), metrics)
     print(f"\nSaved to {run_dir}")

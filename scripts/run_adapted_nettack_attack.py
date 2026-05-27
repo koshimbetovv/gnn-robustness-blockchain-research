@@ -9,7 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.datasets.elliptic import EllipticDataset, EllipticConfig
 from src.datasets.ellipticpp_actors import EllipticPPActorsDataset, EllipticPPActorsConfig
-from src.attacks.nettack_adapted import AdaptedNettackAttack
+from src.attacks.nettack_adapted import (
+    AdaptedNettackAttack, _build_A_hat, _make_undirected_no_self_loops,
+)
 from src.attacks.model_forward import forward_logits, STATIC_MODELS
 from src.utils.model_loader import load_model
 from src.utils.seed import set_seed
@@ -21,7 +23,7 @@ from src.training.metrics import (
 from src.utils.attack_targets import pick_target_nodes
 
 # ---------- attack parameters ----------
-MODEL_NAME = "gcn"
+MODEL_NAME = "gcn"          # "gcn", "graphsage", "gat", "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -50,8 +52,8 @@ SURROGATE_WEIGHT_DECAY = 5e-4
 # ---------- target selection controls ----------
 # Adapted NETTACK is binary illicit -> licit, so always attack only illicit nodes.
 ATTACK_ONLY_ILLICIT = True
-ATTACK_FRACTION = 1.0
-ONLY_CLEAN_CORRECT = True
+ATTACK_FRACTION = 0.5
+ONLY_CLEAN_CORRECT = False
 SEED = 0
 
 # Progress logging during the per-target greedy loop.
@@ -77,6 +79,16 @@ def make_run_dir(model_name: str):
 def write_json(path: str, obj: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+@torch.no_grad()
+def surrogate_logits(x: torch.Tensor, edge_index: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    num_nodes = int(x.size(0))
+    edges_no_sl = _make_undirected_no_self_loops(edge_index, num_nodes)
+    A_hat, _ = _build_A_hat(edges_no_sl, num_nodes, x.device)
+    AX = torch.sparse.mm(A_hat, x)
+    AAX = torch.sparse.mm(A_hat, AX)
+    return AAX @ W
 
 
 def main():
@@ -122,18 +134,6 @@ def main():
     with torch.no_grad():
         logits_clean = forward_logits(model, data.x, data.edge_index, time_step=time_step)
 
-    targets = pick_target_nodes(
-        data, logits_clean, split_mask,
-        only_illicit=ATTACK_ONLY_ILLICIT,
-        fraction=ATTACK_FRACTION,
-        only_clean_correct=ONLY_CLEAN_CORRECT,
-        seed=SEED,
-        device=device,
-    )
-    if targets.numel() == 0:
-        print("No eligible target nodes found for the chosen settings.")
-        return
-
     atk = AdaptedNettackAttack(
         model, data, device,
         clamp=CLAMP,
@@ -148,6 +148,21 @@ def main():
         verbose=VERBOSE,
         progress_every=PROGRESS_EVERY,
     )
+    with torch.no_grad():
+        logits_surrogate_clean = surrogate_logits(data.x.float(), data.edge_index.long(), atk.W)
+
+    targets = pick_target_nodes(
+        data, logits_surrogate_clean, split_mask,
+        only_illicit=ATTACK_ONLY_ILLICIT,
+        fraction=ATTACK_FRACTION,
+        only_clean_correct=ONLY_CLEAN_CORRECT,
+        seed=SEED,
+        device=device,
+    )
+    if targets.numel() == 0:
+        print("No eligible target nodes found for the chosen settings.")
+        return
+
     t_start = time.perf_counter()
     x_adv, edge_index_adv = atk.attack(targets, n_struct=N_STRUCT, eps_feat=EPS_FEAT)
     attack_time_seconds = float(time.perf_counter() - t_start)
@@ -156,6 +171,7 @@ def main():
     # because Adapted-NETTACK also adds graph edges, not just feature deltas.
     with torch.no_grad():
         logits_adv = forward_logits(model, x_adv, edge_index_adv, time_step=time_step)
+        logits_surrogate_adv = surrogate_logits(x_adv.float(), edge_index_adv.long(), atk.W)
 
     attack_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
     attack_mask[targets] = True
@@ -173,6 +189,15 @@ def main():
 
     asr, ns, na = attack_success_rate(data.y, logits_clean.argmax(1), logits_adv.argmax(1), attack_mask)
     asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(data.y, logits_clean, logits_adv, attack_mask)
+    surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
+        data.y,
+        logits_surrogate_clean.argmax(1),
+        logits_surrogate_adv.argmax(1),
+        attack_mask,
+    )
+    surrogate_asr_p, surrogate_sp, surrogate_ap, surrogate_asr_n, surrogate_sn, surrogate_an = asr_pos_neg(
+        data.y, logits_surrogate_clean, logits_surrogate_adv, attack_mask,
+    )
 
     # Mean L2 perturbation over successful label flips on the perturbable raw slice.
     pert_dim = int(atk.attack_dim)
@@ -187,6 +212,15 @@ def main():
 
     f1_pos_drop_split = float(clean_m_split.f1_pos - adv_m_split.f1_pos)
     recall_pos_drop_split = float(clean_m_split.recall_pos - adv_m_split.recall_pos)
+    surrogate_clean_m_split = evaluate_logits_on_split(
+        logits_surrogate_clean, data.y, split_mask, SPLIT,
+    )
+    surrogate_adv_m_split = evaluate_logits_on_split(
+        logits_surrogate_adv, data.y, split_mask, SPLIT,
+    )
+    surrogate_f1_pos_drop_split = float(
+        surrogate_clean_m_split.f1_pos - surrogate_adv_m_split.f1_pos
+    )
 
     # Edge-addition accounting (Adapted-NETTACK specific).
     n_edges_orig = int(data.edge_index.size(1))
@@ -217,6 +251,7 @@ def main():
             "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
         },
         "target_selection": {
+            "model": "surrogate_linearized_gcn",
             "attack_only_illicit": ATTACK_ONLY_ILLICIT,
             "attack_fraction": ATTACK_FRACTION,
             "only_clean_correct": ONLY_CLEAN_CORRECT,
@@ -276,6 +311,34 @@ def main():
                     float(n_unique_added) / float(targets.numel())
                     if targets.numel() > 0 else 0.0
                 ),
+            },
+        },
+        "surrogate": {
+            "classification": {
+                "split": SPLIT,
+                "n": surrogate_clean_m_split.n_labeled,
+                "f1_pos": {
+                    "clean": surrogate_clean_m_split.f1_pos,
+                    "adv": surrogate_adv_m_split.f1_pos,
+                    "drop": surrogate_f1_pos_drop_split,
+                },
+                "clean_metrics": vars(surrogate_clean_m_split),
+                "adv_metrics": vars(surrogate_adv_m_split),
+            },
+            "attack_effect": {
+                "asr": {
+                    "value": surrogate_asr,
+                    "success": surrogate_ns,
+                    "attempted": surrogate_na,
+                },
+                "asr_pos_neg": {
+                    "asr_pos": surrogate_asr_p,
+                    "succ_pos": surrogate_sp,
+                    "attempted_pos": surrogate_ap,
+                    "asr_neg": surrogate_asr_n,
+                    "succ_neg": surrogate_sn,
+                    "attempted_neg": surrogate_an,
+                },
             },
         },
     }

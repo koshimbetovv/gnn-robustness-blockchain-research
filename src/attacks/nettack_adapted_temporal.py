@@ -29,6 +29,23 @@ from src.attacks.nettack_adapted import (
 )
 
 
+@torch.no_grad()
+def linearized_surrogate_logits(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    W: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the shared linearized-GCN surrogate Z = A_hat^2 X W."""
+    device = W.device
+    x = x.to(device).float()
+    edge_index = edge_index.to(device).long()
+    N = int(x.size(0))
+    edges_no_sl = _make_undirected_no_self_loops(edge_index, N)
+    A_hat, _ = _build_A_hat(edges_no_sl, N, device)
+    AAX = torch.sparse.mm(A_hat, torch.sparse.mm(A_hat, x))
+    return AAX @ W
+
+
 def train_surrogate_on_train_slices(
     train_slices: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     num_features: int,
