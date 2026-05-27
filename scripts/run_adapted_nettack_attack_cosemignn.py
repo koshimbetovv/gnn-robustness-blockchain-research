@@ -162,7 +162,7 @@ def main():
     # ----- train surrogate on union of train timesteps -----
     print("Training surrogate (linearized GCN) on union of train timesteps ...")
     train_slices = []
-    for t in range(train_start, train_end + 1):
+    for t in range(train_start, train_end):
         if t >= len(feature_list):
             break
         ft = feature_list[t]; adj = adj_list[t]; lbl = label_list[t]
@@ -172,12 +172,12 @@ def main():
         train_mask = (lbl != -1)
         if int(train_mask.sum().item()) == 0:
             continue
-        train_slices.append((ft.float(), adj.long(), lbl.long(), train_mask))
+        train_slices.append((ft[:, :raw_feature_dim].float(), adj.long(), lbl.long(), train_mask))
     if not train_slices:
         raise RuntimeError("No CoSemiGNN train slices found for surrogate training.")
     W = train_surrogate_on_train_slices(
         train_slices,
-        num_features=feature_in,
+        num_features=raw_feature_dim,
         num_classes=2,
         device=device,
         epochs=SURROGATE_EPOCHS,
@@ -186,7 +186,9 @@ def main():
     )
 
     # NETTACK perturbs the leading raw_feature_dim columns; the trailing 6 semi
-    # columns are frozen oracle outputs (matching PGD-CoSemi convention).
+    # columns are frozen oracle outputs (matching PGD-CoSemi convention). The
+    # surrogate is trained and queried on raw features only to avoid using the
+    # label-derived semi-supervised teacher columns as attack-side information.
     atk = AdaptedNettackTemporalAttack(
         W=W, device=device,
         attack_dim=raw_feature_dim,
@@ -232,7 +234,9 @@ def main():
 
         with torch.no_grad():
             logits_clean = cosemi_forward_logits(model, features, adj, ca_weights).detach()
-            logits_surrogate_clean = linearized_surrogate_logits(features.float(), adj.long(), W)
+            logits_surrogate_clean = linearized_surrogate_logits(
+                features[:, :raw_feature_dim].float(), adj.long(), W,
+            )
         pred_clean = logits_clean.argmax(dim=1)
         pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
 
@@ -268,17 +272,20 @@ def main():
         targets = idx
 
         t0 = time.perf_counter()
-        x_adv, edge_index_adv, info = atk.attack_slice(
-            features.float(), adj.long(), labels.long(), targets,
+        x_raw_adv, edge_index_adv, info = atk.attack_slice(
+            features[:, :raw_feature_dim].float(), adj.long(), labels.long(), targets,
             n_struct=N_STRUCT, eps_feat=EPS_FEAT,
         )
         attack_time_seconds += float(time.perf_counter() - t0)
         n_unique_added_total += int(info["n_unique_edges_added"])
         n_targets_with_edge_total += int(info["n_targets_with_edge_added"])
 
+        x_adv = features.clone()
+        x_adv[:, :raw_feature_dim] = x_raw_adv
+
         with torch.no_grad():
             logits_adv = cosemi_forward_logits(model, x_adv, edge_index_adv, ca_weights).detach()
-            logits_surrogate_adv = linearized_surrogate_logits(x_adv, edge_index_adv, W)
+            logits_surrogate_adv = linearized_surrogate_logits(x_raw_adv, edge_index_adv, W)
         pred_adv = logits_adv.argmax(dim=1)
         pred_surrogate_adv = logits_surrogate_adv.argmax(dim=1)
 
@@ -478,6 +485,11 @@ def main():
             "surrogate_lr": SURROGATE_LR,
             "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
             "raw_feature_dim": raw_feature_dim,
+            "surrogate_feature_scope": "raw_only",
+            "surrogate_train_range": {
+                "start": train_start,
+                "end_exclusive": train_end,
+            },
         },
         "timesteps": {"predict_start": predict_start, "predict_end": predict_end},
         "target_selection": {

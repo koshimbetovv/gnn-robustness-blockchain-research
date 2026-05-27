@@ -52,7 +52,7 @@ SURROGATE_WEIGHT_DECAY = 5e-4
 # ---------- target selection controls ----------
 # Adapted NETTACK is binary illicit -> licit, so always attack only illicit nodes.
 ATTACK_ONLY_ILLICIT = True
-ATTACK_FRACTION = 0.5
+ATTACK_FRACTION = 1.0
 ONLY_CLEAN_CORRECT = False
 SEED = 0
 
