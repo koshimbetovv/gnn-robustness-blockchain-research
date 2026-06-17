@@ -33,7 +33,7 @@ ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
         "cosemignn": "scripts/run_node_injection_attack_cosemignn.py",
     },
     "adapted_nettack": {
-        "static": "scripts/run_adapted_nettack_attack.py",
+        "static": "scripts/run_adapted_nettack_attack_pertarget.py",
         "recgnn": "scripts/run_adapted_nettack_attack_recgnn.py",
         "evolvegcn_o": "scripts/run_adapted_nettack_attack_evolvegcn.py",
         "cosemignn": "scripts/run_adapted_nettack_attack_cosemignn.py",
