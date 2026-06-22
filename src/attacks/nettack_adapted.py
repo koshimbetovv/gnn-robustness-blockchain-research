@@ -11,6 +11,8 @@ Adaptations from Zuegner et al. (KDD 2018):
 5. Direct attack (A = {v_0}); only edges (v_0, u) and X[v_0, :] may be perturbed.
 6. Edge ADDITIONS only (no deletions).
 7. Power-law chi^2 degree-distribution unnoticeability constraint (Eq. 6-9).
+8. If node `time_step` metadata is available, structural additions are restricted
+   to same-timestep nodes.
 
 The greedy loop matches the paper's per-iteration choice between a structure or
 feature step. Once the L2 feature budget is committed (single closed-form step),
@@ -106,8 +108,14 @@ class AdaptedNettackAttack(BaseAttack):
         self.x = data.x.to(device).detach().clone()
         self.y = data.y.to(device).long()
         self.edge_index_orig = data.edge_index.to(device).clone()
+        self.N = int(self.x.size(0))
         ts = getattr(data, "time_step", None)
-        self.time_step = ts.to(device) if torch.is_tensor(ts) else None
+        self.time_step = ts.to(device).view(-1) if torch.is_tensor(ts) else None
+        if self.time_step is not None and self.time_step.numel() != self.N:
+            raise ValueError(
+                f"time_step must have one value per node ({self.N}), "
+                f"got {self.time_step.numel()}."
+            )
         self.clamp = clamp
         self.attack_dim = int(attack_dim) if attack_dim is not None else int(self.x.size(1))
         if not (1 <= self.attack_dim <= self.x.size(1)):
@@ -116,7 +124,6 @@ class AdaptedNettackAttack(BaseAttack):
         self.d_min = int(d_min)
         self.chi2_tau = float(chi2_tau)
         self.enforce_degree_constraint = bool(enforce_degree_constraint)
-        self.N = int(self.x.size(0))
         self.K = 2
         self.verbose = bool(verbose)
         self.progress_every = int(progress_every)
@@ -352,6 +359,8 @@ class AdaptedNettackAttack(BaseAttack):
             in_N_v0[nbrs_v0] = True
             cand_mask = ~in_N_v0
             cand_mask[v0] = False
+            if self.time_step is not None:
+                cand_mask &= self.time_step == self.time_step[v0]
 
             if edges_used < n_struct:
                 candidates = torch.where(cand_mask)[0]

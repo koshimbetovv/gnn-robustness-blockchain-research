@@ -370,6 +370,7 @@ def main():
             "d_min": D_MIN,
             "chi2_tau": CHI2_TAU,
             "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "same_timestep_edge_candidates": bool(atk.time_step is not None),
             "surrogate_epochs": SURROGATE_EPOCHS,
             "surrogate_lr": SURROGATE_LR,
             "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
