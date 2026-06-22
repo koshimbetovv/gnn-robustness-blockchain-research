@@ -34,9 +34,15 @@ RUN_ID = None
 #   N_STRUCT  : maximum number of edge ADDITIONS per target (no deletions).
 #   EPS_FEAT  : per-target L2 budget for the closed-form continuous feature step.
 #   CLAMP     : optional [lo, hi] clip applied to the final x_adv (e.g. (-3.0, 3.0)).
-N_STRUCT = 2
+N_STRUCT = 1
 EPS_FEAT = 0.05
 CLAMP = None
+
+# CoSemiGNN consumes PyG-style edge_index. Directed mode adds one incoming edge
+# u -> target per structural perturbation. Use "undirected" to recover the
+# original Nettack-style symmetrized threat model.
+STRUCTURE_MODE = "directed"  # "directed" or "undirected"
+DIRECTED_EDGE_DIRECTION = "incoming_to_target"
 
 # Power-law chi^2 unnoticeability test (Eqs. 6-9 in the paper).
 D_MIN = 2
@@ -183,6 +189,7 @@ def main():
         epochs=SURROGATE_EPOCHS,
         lr=SURROGATE_LR,
         weight_decay=SURROGATE_WEIGHT_DECAY,
+        structure_mode=STRUCTURE_MODE,
     )
 
     # NETTACK perturbs the leading raw_feature_dim columns; the trailing 6 semi
@@ -195,6 +202,8 @@ def main():
         clamp=CLAMP,
         d_min=D_MIN, chi2_tau=CHI2_TAU,
         enforce_degree_constraint=ENFORCE_DEGREE_CONSTRAINT,
+        structure_mode=STRUCTURE_MODE,
+        directed_edge_direction=DIRECTED_EDGE_DIRECTION,
         verbose=VERBOSE, progress_every=PROGRESS_EVERY,
     )
 
@@ -235,7 +244,10 @@ def main():
         with torch.no_grad():
             logits_clean = cosemi_forward_logits(model, features, adj, ca_weights).detach()
             logits_surrogate_clean = linearized_surrogate_logits(
-                features[:, :raw_feature_dim].float(), adj.long(), W,
+                features[:, :raw_feature_dim].float(),
+                adj.long(),
+                W,
+                structure_mode=STRUCTURE_MODE,
             )
         pred_clean = logits_clean.argmax(dim=1)
         pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
@@ -274,7 +286,9 @@ def main():
         t0 = time.perf_counter()
         x_raw_adv, edge_index_adv, info = atk.attack_slice(
             features[:, :raw_feature_dim].float(), adj.long(), labels.long(), targets,
-            n_struct=N_STRUCT, eps_feat=EPS_FEAT,
+            n_struct=N_STRUCT,
+            eps_feat=EPS_FEAT,
+            time_step=torch.zeros(features.size(0), dtype=torch.long, device=device),
         )
         attack_time_seconds += float(time.perf_counter() - t0)
         n_unique_added_total += int(info["n_unique_edges_added"])
@@ -285,7 +299,9 @@ def main():
 
         with torch.no_grad():
             logits_adv = cosemi_forward_logits(model, x_adv, edge_index_adv, ca_weights).detach()
-            logits_surrogate_adv = linearized_surrogate_logits(x_raw_adv, edge_index_adv, W)
+            logits_surrogate_adv = linearized_surrogate_logits(
+                x_raw_adv, edge_index_adv, W, structure_mode=STRUCTURE_MODE,
+            )
         pred_adv = logits_adv.argmax(dim=1)
         pred_surrogate_adv = logits_surrogate_adv.argmax(dim=1)
 
@@ -481,6 +497,15 @@ def main():
             "n_struct": N_STRUCT, "eps_feat": EPS_FEAT, "clamp": CLAMP,
             "d_min": D_MIN, "chi2_tau": CHI2_TAU,
             "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "structure_mode": STRUCTURE_MODE,
+            "directed_edge_direction": (
+                DIRECTED_EDGE_DIRECTION if STRUCTURE_MODE == "directed" else None
+            ),
+            "degree_constraint_scope": (
+                "in_degree" if STRUCTURE_MODE == "directed" else "undirected_degree"
+            ),
+            "same_timestep_edge_candidates": True,
+            "edge_candidate_scope": "current_timestep_nodes",
             "surrogate_epochs": SURROGATE_EPOCHS,
             "surrogate_lr": SURROGATE_LR,
             "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,

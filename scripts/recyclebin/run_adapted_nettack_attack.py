@@ -10,7 +10,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.datasets.elliptic import EllipticDataset, EllipticConfig
 from src.datasets.ellipticpp_actors import EllipticPPActorsDataset, EllipticPPActorsConfig
 from src.attacks.nettack_adapted import (
-    AdaptedNettackAttack, _build_A_hat, _make_undirected_no_self_loops,
+    AdaptedNettackAttack,
+    _build_A_hat,
+    _build_A_hat_directed,
+    _make_directed_no_self_loops,
+    _make_undirected_no_self_loops,
 )
 from src.attacks.model_forward import forward_logits, STATIC_MODELS
 from src.utils.model_loader import load_model
@@ -38,6 +42,12 @@ SPLIT = "test"
 N_STRUCT = 5
 EPS_FEAT = 0.05
 CLAMP = None
+
+# Static Elliptic/Elliptic++ edge_index is directed. Directed mode adds one
+# incoming edge u -> target per structural perturbation. Use "undirected" to
+# recover the original Nettack-style symmetrized threat model.
+STRUCTURE_MODE = "directed"  # "directed" or "undirected"
+DIRECTED_EDGE_DIRECTION = "incoming_to_target"
 
 # Power-law chi^2 unnoticeability test (Eqs. 6-9 in the paper).
 D_MIN = 2
@@ -82,10 +92,21 @@ def write_json(path: str, obj: dict):
 
 
 @torch.no_grad()
-def surrogate_logits(x: torch.Tensor, edge_index: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+def surrogate_logits(
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    W: torch.Tensor,
+    structure_mode: str,
+) -> torch.Tensor:
     num_nodes = int(x.size(0))
-    edges_no_sl = _make_undirected_no_self_loops(edge_index, num_nodes)
-    A_hat, _ = _build_A_hat(edges_no_sl, num_nodes, x.device)
+    if structure_mode == "directed":
+        edges_no_sl = _make_directed_no_self_loops(edge_index, num_nodes)
+        A_hat, _ = _build_A_hat_directed(edges_no_sl, num_nodes, x.device)
+    elif structure_mode == "undirected":
+        edges_no_sl = _make_undirected_no_self_loops(edge_index, num_nodes)
+        A_hat, _ = _build_A_hat(edges_no_sl, num_nodes, x.device)
+    else:
+        raise ValueError(f"Unknown structure_mode={structure_mode!r}.")
     AX = torch.sparse.mm(A_hat, x)
     AAX = torch.sparse.mm(A_hat, AX)
     return AAX @ W
@@ -145,11 +166,15 @@ def main():
         surrogate_epochs=SURROGATE_EPOCHS,
         surrogate_lr=SURROGATE_LR,
         surrogate_weight_decay=SURROGATE_WEIGHT_DECAY,
+        structure_mode=STRUCTURE_MODE,
+        directed_edge_direction=DIRECTED_EDGE_DIRECTION,
         verbose=VERBOSE,
         progress_every=PROGRESS_EVERY,
     )
     with torch.no_grad():
-        logits_surrogate_clean = surrogate_logits(data.x.float(), data.edge_index.long(), atk.W)
+        logits_surrogate_clean = surrogate_logits(
+            data.x.float(), data.edge_index.long(), atk.W, STRUCTURE_MODE,
+        )
 
     targets = pick_target_nodes(
         data, logits_surrogate_clean, split_mask,
@@ -171,7 +196,9 @@ def main():
     # because Adapted-NETTACK also adds graph edges, not just feature deltas.
     with torch.no_grad():
         logits_adv = forward_logits(model, x_adv, edge_index_adv, time_step=time_step)
-        logits_surrogate_adv = surrogate_logits(x_adv.float(), edge_index_adv.long(), atk.W)
+        logits_surrogate_adv = surrogate_logits(
+            x_adv.float(), edge_index_adv.long(), atk.W, STRUCTURE_MODE,
+        )
 
     attack_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
     attack_mask[targets] = True
@@ -225,9 +252,9 @@ def main():
     # Edge-addition accounting (Adapted-NETTACK specific).
     n_edges_orig = int(data.edge_index.size(1))
     n_edges_adv = int(edge_index_adv.size(1))
-    n_unique_added = len(atk._added_edges)  # (v0, u) pairs, before symmetrization
+    n_unique_added = len(atk._added_edges)
     n_directed_added = n_edges_adv - n_edges_orig
-    n_targets_with_edge = len({v0 for (v0, _) in atk._added_edges})
+    n_targets_with_edge = len(set(getattr(atk, "_added_edge_target_nodes", [])))
 
     print()
     run_dir, ts = make_run_dir(MODEL_NAME)
@@ -246,6 +273,13 @@ def main():
             "d_min": D_MIN,
             "chi2_tau": CHI2_TAU,
             "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "structure_mode": STRUCTURE_MODE,
+            "directed_edge_direction": (
+                DIRECTED_EDGE_DIRECTION if STRUCTURE_MODE == "directed" else None
+            ),
+            "degree_constraint_scope": (
+                "in_degree" if STRUCTURE_MODE == "directed" else "undirected_degree"
+            ),
             "same_timestep_edge_candidates": bool(atk.time_step is not None),
             "surrogate_epochs": SURROGATE_EPOCHS,
             "surrogate_lr": SURROGATE_LR,

@@ -25,8 +25,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.attacks.nettack_adapted import (
-    AdaptedNettackAttack, _build_A_hat, _make_undirected_no_self_loops,
+    AdaptedNettackAttack,
+    _build_A_hat,
+    _build_A_hat_directed,
+    _make_directed_no_self_loops,
+    _make_undirected_no_self_loops,
 )
+
+
+def _validate_structure_mode(structure_mode: str) -> str:
+    if structure_mode not in {"undirected", "directed"}:
+        raise ValueError("structure_mode must be 'undirected' or 'directed'.")
+    return structure_mode
+
+
+def _build_temporal_surrogate_A_hat(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    device,
+    structure_mode: str,
+):
+    structure_mode = _validate_structure_mode(structure_mode)
+    if structure_mode == "directed":
+        edges_no_sl = _make_directed_no_self_loops(edge_index, num_nodes)
+        return _build_A_hat_directed(edges_no_sl, num_nodes, device)
+    edges_no_sl = _make_undirected_no_self_loops(edge_index, num_nodes)
+    return _build_A_hat(edges_no_sl, num_nodes, device)
 
 
 @torch.no_grad()
@@ -34,14 +58,17 @@ def linearized_surrogate_logits(
     x: torch.Tensor,
     edge_index: torch.Tensor,
     W: torch.Tensor,
+    *,
+    structure_mode: str = "undirected",
 ) -> torch.Tensor:
     """Evaluate the shared linearized-GCN surrogate Z = A_hat^2 X W."""
     device = W.device
     x = x.to(device).float()
     edge_index = edge_index.to(device).long()
     N = int(x.size(0))
-    edges_no_sl = _make_undirected_no_self_loops(edge_index, N)
-    A_hat, _ = _build_A_hat(edges_no_sl, N, device)
+    A_hat, _ = _build_temporal_surrogate_A_hat(
+        edge_index, N, device, structure_mode,
+    )
     AAX = torch.sparse.mm(A_hat, torch.sparse.mm(A_hat, x))
     return AAX @ W
 
@@ -56,12 +83,14 @@ def train_surrogate_on_train_slices(
     lr: float = 0.01,
     weight_decay: float = 5e-4,
     verbose: bool = True,
+    structure_mode: str = "undirected",
 ) -> torch.Tensor:
     """Train a single linearized-GCN surrogate W in R^{D x K} on the union of train slices.
 
     Each slice is `(x, edge_index, y, train_mask)`:
       - `x`           : (N_t, D) feature matrix at slice t
-      - `edge_index`  : (2, |E_t|) directed/undirected pairs at slice t
+      - `edge_index`  : (2, |E_t|) pairs at slice t. In directed mode this
+                        follows PyG source -> target convention.
       - `y`           : (N_t,) labels at slice t (-1 for unlabeled)
       - `train_mask`  : (N_t,) bool mask of nodes used to fit W
 
@@ -69,8 +98,13 @@ def train_surrogate_on_train_slices(
     so the surrogate jointly fits the temporally-varying graph distribution
     rather than memorizing a single slice. `A_hat^2 X` is precomputed per slice.
 
+    `structure_mode` controls whether each slice's surrogate uses the original
+    Nettack-style undirected normalization or the directed source-to-target
+    normalization used by the static directed attack.
+
     Returns: detached W tensor on `device`, shape (D, K).
     """
+    structure_mode = _validate_structure_mode(structure_mode)
     cached: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for x, edge_index, y, train_mask in train_slices:
         x = x.to(device).float()
@@ -80,8 +114,9 @@ def train_surrogate_on_train_slices(
         if int(train_mask.sum().item()) == 0:
             continue
         N = int(x.size(0))
-        edges_no_sl = _make_undirected_no_self_loops(edge_index, N)
-        A_hat, _ = _build_A_hat(edges_no_sl, N, device)
+        A_hat, _ = _build_temporal_surrogate_A_hat(
+            edge_index, N, device, structure_mode,
+        )
         AAX = torch.sparse.mm(A_hat, torch.sparse.mm(A_hat, x))
         cached.append((AAX, y, train_mask))
 
@@ -145,9 +180,16 @@ class AdaptedNettackTemporalAttack:
         d_min: int = 2,
         chi2_tau: float = 0.004,
         enforce_degree_constraint: bool = True,
+        structure_mode: str = "undirected",
+        directed_edge_direction: str = "incoming_to_target",
         verbose: bool = False,
         progress_every: int = 100,
     ):
+        structure_mode = _validate_structure_mode(structure_mode)
+        if directed_edge_direction != "incoming_to_target":
+            raise ValueError(
+                "Only directed_edge_direction='incoming_to_target' is supported."
+            )
         self.W = W.to(device).detach()
         self.device = device
         self.attack_dim = None if attack_dim is None else int(attack_dim)
@@ -155,6 +197,8 @@ class AdaptedNettackTemporalAttack:
         self.d_min = int(d_min)
         self.chi2_tau = float(chi2_tau)
         self.enforce_degree_constraint = bool(enforce_degree_constraint)
+        self.structure_mode = structure_mode
+        self.directed_edge_direction = directed_edge_direction
         self.verbose = bool(verbose)
         self.progress_every = int(progress_every)
         self._dummy_model = _DummyModel().to(device).eval()
@@ -167,19 +211,27 @@ class AdaptedNettackTemporalAttack:
         target_idx: torch.Tensor,
         n_struct: int = 2,
         eps_feat: float = 0.05,
+        time_step: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """Run Adapted-NETTACK on a single temporal slice.
 
         Returns `(x_adv, edge_index_adv, info)` where `info` reports
         `n_unique_edges_added`, `n_targets_with_edge_added`, and
-        `n_directed_edges_added` for downstream metrics.
+        `n_directed_edges_added` for downstream metrics. In directed mode one
+        structural perturbation is one incoming edge `u -> target`; in
+        undirected mode it is one undirected edge materialized as two directed
+        entries in `edge_index_adv`.
         """
         x = x.to(self.device).float()
         edge_index = edge_index.to(self.device).long()
         y = y.to(self.device).long()
         target_idx = target_idx.to(self.device).long().view(-1)
+        if time_step is not None:
+            time_step = time_step.to(self.device).view(-1)
 
         data = SimpleNamespace(x=x, y=y, edge_index=edge_index)
+        if time_step is not None:
+            data.time_step = time_step
         atk = AdaptedNettackAttack(
             self._dummy_model,
             data,
@@ -191,6 +243,8 @@ class AdaptedNettackTemporalAttack:
             chi2_tau=self.chi2_tau,
             enforce_degree_constraint=self.enforce_degree_constraint,
             pretrained_W=self.W,
+            structure_mode=self.structure_mode,
+            directed_edge_direction=self.directed_edge_direction,
             verbose=self.verbose,
             progress_every=self.progress_every,
         )
@@ -200,11 +254,29 @@ class AdaptedNettackTemporalAttack:
         )
 
         added = list(atk._added_edges)
+        added_target_nodes = getattr(atk, "_added_edge_target_nodes", [])
+        if not added_target_nodes and added:
+            if self.structure_mode == "directed":
+                added_target_nodes = [v for (_, v) in added]
+            else:
+                added_target_nodes = [v for (v, _) in added]
         info = {
             "n_unique_edges_added": int(len(added)),
             "n_directed_edges_added": int(edge_index_adv.size(1) - edge_index.size(1)),
-            "n_targets_with_edge_added": int(len({v0 for (v0, _) in added})),
+            "n_targets_with_edge_added": int(len(set(added_target_nodes))),
             "perturbable_dim": int(atk.attack_dim),
+            "structure_mode": self.structure_mode,
+            "directed_edge_direction": (
+                self.directed_edge_direction
+                if self.structure_mode == "directed"
+                else None
+            ),
+            "degree_constraint_scope": (
+                "in_degree"
+                if self.structure_mode == "directed"
+                else "undirected_degree"
+            ),
+            "same_timestep_edge_candidates": bool(time_step is not None),
         }
         return x_adv.detach(), edge_index_adv.detach(), info
 
@@ -213,8 +285,9 @@ class AdaptedNettackTemporalAttack:
         """Convert a torch sparse-COO adjacency to a (2, |E|) edge_index.
 
         Used by EvolveGCN/CoSemiGNN drivers whose datasets store adjacencies as
-        sparse tensors. The adjacency is assumed to encode a directed-pair list
-        (NETTACK will symmetrize internally).
+        sparse tensors. The returned indices preserve the adjacency orientation;
+        callers that store row-aggregation matrices should convert to
+        source -> target convention before invoking the directed attack.
         """
         if not adj_sparse.is_sparse:
             raise ValueError("edge_index_from_sparse_adj expects a sparse tensor.")

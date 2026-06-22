@@ -7,16 +7,15 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from scripts.training.train_evolvegcn_utils import build_evolvegcn_model, move_sample
-from src.datasets.evolvegcn_elliptic import EvolveGCNEllipticConfig, EvolveGCNEllipticDataset
-from src.datasets.evolvegcn_ellipticpp_actors import (
-    EvolveGCNActorsConfig, EvolveGCNEllipticPPActorsDataset,
+from src.datasets.recgnn_elliptic import RecGNNEllipticConfig, RecGNNEllipticDataset
+from src.datasets.recgnn_ellipticpp_actors import (
+    RecGNNEllipticPPActorsConfig, RecGNNEllipticPPActorsDataset,
 )
 from src.attacks.nettack_adapted_temporal import (
     AdaptedNettackTemporalAttack, linearized_surrogate_logits,
     train_surrogate_on_train_slices,
 )
-from src.utils.model_loader import resolve_checkpoint
+from src.utils.model_loader import load_model, resolve_checkpoint
 from src.utils.seed import set_seed
 from src.training.metrics import (
     binary_classification_metrics, attack_success_rate, roc_auc_binary,
@@ -24,7 +23,7 @@ from src.training.metrics import (
 )
 
 # ---------- attack parameters ----------
-MODEL_NAME = "evolvegcn_o"
+MODEL_NAME = "recgnn"
 MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -40,6 +39,12 @@ N_STRUCT = 2
 EPS_FEAT = 0.05
 CLAMP = None
 
+# RecGNN edge_index is directed source -> target. Directed mode adds one
+# incoming edge u -> target per structural perturbation. Use "undirected" to
+# recover the original Nettack-style symmetrized threat model.
+STRUCTURE_MODE = "directed"  # "directed" or "undirected"
+DIRECTED_EDGE_DIRECTION = "incoming_to_target"
+
 # Power-law chi^2 unnoticeability test (Eqs. 6-9 in the paper).
 D_MIN = 2
 CHI2_TAU = 0.004
@@ -50,10 +55,11 @@ SURROGATE_EPOCHS = 200
 SURROGATE_LR = 0.01
 SURROGATE_WEIGHT_DECAY = 5e-4
 
-# Column 0 of the EvolveGCN Elliptic feature matrix is the IBM time_step
-# metadata. Protect it from perturbation. Elliptic++ actors has no metadata
-# column. `None` -> dataset-appropriate default.
-ATTACK_START_COL = None
+# Number of controllable feature columns. RecGNN appends 2 ANF (antecedent
+# neighbour-label count) columns derived from the graph; they're not directly
+# controllable by perturbing the target's own feature row, so NETTACK only
+# touches the leading raw slice. `None` -> dataset-appropriate default.
+ATTACK_DIM = None
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
@@ -68,6 +74,8 @@ PROGRESS_EVERY = 100
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -84,45 +92,42 @@ def write_json(path: str, obj: dict):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
-def edge_index_from_normalized_adj(adj_sparse: torch.Tensor) -> torch.Tensor:
-    """Recover an undirected edge_index from EvolveGCN's normalized adjacency.
-
-    The dataset's `_normalize_adj` adds self-loops then symmetric-normalizes; we
-    drop self-loops to get the bare graph edges (still symmetric, since the
-    EvolveGCN loaders insert both (u,v) and (v,u)).
-    """
-    idx = adj_sparse.coalesce().indices().long()
-    mask = idx[0] != idx[1]
-    return idx[:, mask]
-
-
-def normalize_adj_evolvegcn(edge_index: torch.Tensor, num_nodes: int, device) -> torch.Tensor:
-    """Mirror EvolveGCN's `_normalize_adj` so a NETTACK-perturbed edge_index can
-    be fed back into the victim. Adds self-loops and applies symmetric
-    `D~^{-1/2} (A + I) D~^{-1/2}` normalization, returning a coalesced sparse
-    COO tensor of size (N, N).
-    """
-    src, dst = edge_index[0].long(), edge_index[1].long()
-    mask = src != dst
-    src, dst = src[mask], dst[mask]
-    sl = torch.arange(num_nodes, device=device, dtype=torch.long)
-    full_src = torch.cat([src, sl])
-    full_dst = torch.cat([dst, sl])
-    deg = torch.zeros(num_nodes, device=device, dtype=torch.float32)
-    deg.scatter_add_(0, full_src, torch.ones_like(full_src, dtype=torch.float32))
-    inv_sqrt = deg.clamp(min=1.0).pow(-0.5)
-    vals = inv_sqrt[full_src] * inv_sqrt[full_dst]
-    indices = torch.stack([full_src, full_dst], dim=0)
-    return torch.sparse_coo_tensor(indices, vals, (num_nodes, num_nodes)).coalesce()
+def pick_targets_graph(y, pred_clean, only_illicit, only_clean_correct, fraction, seed):
+    if not (0.0 < float(fraction) <= 1.0):
+        raise ValueError(f"ATTACK_FRACTION must be in (0, 1], got {fraction}")
+    idx = torch.arange(y.numel(), device=y.device)
+    idx = idx[y[idx] != -1]
+    if only_illicit:
+        idx = idx[y[idx] == 1]
+    if only_clean_correct and idx.numel() > 0:
+        idx = idx[pred_clean[idx] == y[idx]]
+    if idx.numel() == 0:
+        return idx
+    n = max(1, min(int(round(float(fraction) * float(idx.numel()))), int(idx.numel())))
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+    perm = torch.randperm(idx.numel(), generator=g)
+    return idx[perm[:n].to(idx.device)]
 
 
-def _build_y_full(num_nodes: int, label_idx: torch.Tensor, label_vals: torch.Tensor, device) -> torch.Tensor:
-    """Construct an `(N,)` label tensor from `(label_idx, label_vals)`,
-    -1 elsewhere, used both by the surrogate trainer and the per-slice attack.
-    """
-    y = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
-    y[label_idx.long()] = label_vals.long()
-    return y
+def _save_state(model):
+    ml = model.m_lstm
+    ev = ml.cell.evolve_linear
+    def _c(t): return t.detach().clone() if t is not None else None
+    return {
+        "h": _c(ml._h_state), "c": _c(ml._c_state),
+        "ev_h": _c(ev._row_h), "ev_c": _c(ev._row_c),
+        "ev_w": _c(ev._current_weight),
+    }
+
+
+def _restore_state(model, snap):
+    ml = model.m_lstm
+    ev = ml.cell.evolve_linear
+    def _c(t): return t.detach().clone() if t is not None else None
+    ml._h_state = _c(snap["h"]); ml._c_state = _c(snap["c"])
+    ev._row_h = _c(snap["ev_h"]); ev._row_c = _c(snap["ev_c"])
+    ev._current_weight = _c(snap["ev_w"])
 
 
 def main():
@@ -135,71 +140,42 @@ def main():
         ckpt_cfg = json.load(f)
 
     if DATASET == "elliptic":
-        data_cfg = EvolveGCNEllipticConfig(**ckpt_cfg["data"])
-        sequence = EvolveGCNEllipticDataset(data_cfg).get_sequence()
-        default_attack_start_col = 1
+        data_cfg = RecGNNEllipticConfig(**ckpt_cfg["data"])
+        sequence = RecGNNEllipticDataset(data_cfg).get_sequence()
+        default_attack_dim = 93
     elif DATASET == "ellipticpp_actors":
-        data_cfg = EvolveGCNActorsConfig(**ckpt_cfg["data"])
-        sequence = EvolveGCNEllipticPPActorsDataset(data_cfg).get_sequence()
-        default_attack_start_col = 0
+        data_cfg = RecGNNEllipticPPActorsConfig(**ckpt_cfg["data"])
+        sequence = RecGNNEllipticPPActorsDataset(data_cfg).get_sequence()
+        default_attack_dim = sequence.num_features - 2
     else:
         raise ValueError(f"Unknown DATASET={DATASET!r}.")
 
-    attack_start_col = default_attack_start_col if ATTACK_START_COL is None else int(ATTACK_START_COL)
-    num_nodes = int(sequence.num_nodes)
-    num_features = int(sequence.num_features)
+    attack_dim = default_attack_dim if ATTACK_DIM is None else int(ATTACK_DIM)
 
-    model = build_evolvegcn_model(num_features, ckpt_cfg).to(device)
-    state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-    print(f"✓ Loaded {MODEL_NAME.upper()} from {ckpt_path}")
-    print(
-        f"Train windows: {len(sequence.train_samples)}  Test windows: {len(sequence.test_samples)}  "
-        f"num_nodes={num_nodes}  num_features={num_features}  attack_start_col={attack_start_col}"
-    )
+    model = load_model(MODEL_NAME, sequence.num_features, 2, device=device,
+                       model_dir=MODEL_DIR, run_id=RUN_ID)
+    print(f"Train graphs: {len(sequence.train_graphs)}  Test graphs: {len(sequence.test_graphs)}  "
+          f"num_features={sequence.num_features}  attack_dim={attack_dim}")
 
     # ----- train surrogate on union of train timesteps -----
-    # NETTACK perturbs only the **leading** raw slice (`attack_dim` columns
-    # starting at column 0). EvolveGCN protects column 0 (IBM time_step), so we
-    # build a "raw view" feature matrix where col 0 is dropped, train the
-    # surrogate on that view, then map back when applying the attack: NETTACK
-    # output's first `attack_dim` columns get written into the victim's columns
-    # `[attack_start_col : attack_start_col + attack_dim]`.
-    attack_dim = num_features - attack_start_col
-
-    def _features_view(x_full: torch.Tensor) -> torch.Tensor:
-        if attack_start_col == 0:
-            return x_full
-        return torch.cat([x_full[:, attack_start_col:], x_full[:, :attack_start_col]], dim=1)
-
-    def _features_unview(x_view: torch.Tensor) -> torch.Tensor:
-        # Inverse of `_features_view`: restore the original column order.
-        if attack_start_col == 0:
-            return x_view
-        perturbable = x_view[:, :attack_dim]
-        protected = x_view[:, attack_dim:]
-        return torch.cat([protected, perturbable], dim=1)
-
     print("Training surrogate (linearized GCN) on union of train timesteps ...")
     train_slices = []
-    for sample in sequence.train_samples:
-        hist_adj_list, hist_ndFeats_list, _, label_idx, label_vals = move_sample(sample, device)
-        x_view = _features_view(hist_ndFeats_list[-1].float())
-        edge_index = edge_index_from_normalized_adj(hist_adj_list[-1])
-        y_full = _build_y_full(num_nodes, label_idx, label_vals, device)
-        train_mask = (y_full != -1)
+    for g in sequence.train_graphs:
+        g = g.to(device)
+        # Use ALL labeled nodes in the train slice as surrogate-training data.
+        train_mask = (g.y != -1)
         if int(train_mask.sum().item()) == 0:
             continue
-        train_slices.append((x_view, edge_index, y_full, train_mask))
+        train_slices.append((g.x.float(), g.edge_index.long(), g.y.long(), train_mask))
     W = train_surrogate_on_train_slices(
         train_slices,
-        num_features=num_features,
+        num_features=sequence.num_features,
         num_classes=2,
         device=device,
         epochs=SURROGATE_EPOCHS,
         lr=SURROGATE_LR,
         weight_decay=SURROGATE_WEIGHT_DECAY,
+        structure_mode=STRUCTURE_MODE,
     )
 
     atk = AdaptedNettackTemporalAttack(
@@ -208,11 +184,22 @@ def main():
         clamp=CLAMP,
         d_min=D_MIN, chi2_tau=CHI2_TAU,
         enforce_degree_constraint=ENFORCE_DEGREE_CONSTRAINT,
+        structure_mode=STRUCTURE_MODE,
+        directed_edge_direction=DIRECTED_EDGE_DIRECTION,
         verbose=VERBOSE, progress_every=PROGRESS_EVERY,
     )
 
-    # ----- per-window attack -----
-    per_window = []
+    # ----- prime sequence state on clean train graphs -----
+    print("Priming sequence state over train graphs ...")
+    model.reset_sequence_state(device)
+    with torch.no_grad():
+        for g in sequence.train_graphs:
+            g = g.to(device)
+            _ = model(g.x.float(), g.edge_index.long())
+            model.detach_sequence_state()
+
+    # ----- per-timestep attack -----
+    per_timestep = []
     pooled_y_true = []
     pooled_pred_clean = []
     pooled_pred_adv = []
@@ -228,109 +215,129 @@ def main():
     n_targets_with_edge_total = 0
     attack_time_seconds = 0.0
 
-    for sample in sequence.test_samples:
-        hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx, label_vals = move_sample(sample, device)
-        t = int(sample.current_time)
+    for graph in sequence.test_graphs:
+        g = graph.to(device)
+        x = g.x.float()
+        edge_index = g.edge_index.long()
+        y = g.y
+        t = int(g.graph_timestep)
 
-        # Clean forward over full window.
-        with torch.no_grad():
-            logits_clean = model(hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx).detach()
-        pred_clean = logits_clean.argmax(dim=1)
-        x_view = _features_view(hist_ndFeats_list[-1].float())
-        edge_index_curr = edge_index_from_normalized_adj(hist_adj_list[-1])
-        with torch.no_grad():
-            logits_surrogate_clean_full = linearized_surrogate_logits(x_view, edge_index_curr, W)
-        logits_surrogate_clean = logits_surrogate_clean_full[label_idx.long()]
-        pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
-
-        # Pick targets among labeled positions in this window.
-        pos = torch.arange(label_vals.numel(), device=device)
-        pos = pos[label_vals != -1]
-        if ATTACK_ONLY_ILLICIT:
-            pos = pos[label_vals[pos] == 1]
-        if ONLY_CLEAN_CORRECT and pos.numel() > 0:
-            pos = pos[pred_surrogate_clean[pos] == label_vals[pos]]
-
-        if pos.numel() == 0:
-            per_window.append({"t": t, "n_labeled": int(label_idx.numel()),
-                               "n_targets": 0, "skipped": True})
-            pooled_y_true.append(label_vals.detach().cpu())
-            pooled_pred_clean.append(pred_clean.detach().cpu())
-            pooled_pred_adv.append(pred_clean.detach().cpu())
-            pooled_logits_clean.append(logits_clean.detach().cpu())
-            pooled_logits_adv.append(logits_clean.detach().cpu())
-            pooled_attack_mask.append(torch.zeros(label_idx.numel(), dtype=torch.bool))
-            pooled_surrogate_pred_clean.append(pred_surrogate_clean.detach().cpu())
-            pooled_surrogate_pred_adv.append(pred_surrogate_clean.detach().cpu())
-            pooled_surrogate_logits_clean.append(logits_surrogate_clean.detach().cpu())
-            pooled_surrogate_logits_adv.append(logits_surrogate_clean.detach().cpu())
+        labeled_mask = y != -1
+        if int(labeled_mask.sum().item()) == 0:
+            # Advance state along clean trajectory and skip.
+            with torch.no_grad():
+                _ = model(x, edge_index)
+                model.detach_sequence_state()
+            per_timestep.append({"t": t, "n_labeled": 0, "n_targets": 0, "skipped": True})
             continue
 
-        if 0.0 < float(ATTACK_FRACTION) < 1.0:
-            n = max(1, min(int(round(ATTACK_FRACTION * float(pos.numel()))), int(pos.numel())))
-            g = torch.Generator(device="cpu")
-            g.manual_seed(int(SEED + t))
-            perm = torch.randperm(pos.numel(), generator=g)
-            pos = pos[perm[:n].to(pos.device)]
+        # Save pre-state, run clean forward, save post-state.
+        snap_pre = _save_state(model)
+        with torch.no_grad():
+            log_probs_clean = model(x, edge_index).detach()
+            model.detach_sequence_state()
+        snap_post = _save_state(model)
+        pred_clean = log_probs_clean.argmax(dim=1)
+        with torch.no_grad():
+            logits_surrogate_clean = linearized_surrogate_logits(
+                x, edge_index, W, structure_mode=STRUCTURE_MODE,
+            )
+        pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
 
-        target_global = label_idx[pos].long()
-        target_pos = pos
+        targets = pick_targets_graph(
+            y, pred_surrogate_clean,
+            only_illicit=ATTACK_ONLY_ILLICIT,
+            only_clean_correct=ONLY_CLEAN_CORRECT,
+            fraction=ATTACK_FRACTION,
+            seed=SEED + t,
+        )
 
-        # Build per-slice tensors for NETTACK.
-        y_full = _build_y_full(num_nodes, label_idx, label_vals, device)
+        if targets.numel() == 0:
+            # No attackable targets: keep clean trajectory, pool clean as adv.
+            _restore_state(model, snap_post)
+            per_timestep.append({"t": t, "n_labeled": int(labeled_mask.sum().item()),
+                                 "n_targets": 0, "skipped": True})
+            pooled_y_true.append(y[labeled_mask].detach().cpu())
+            pooled_pred_clean.append(pred_clean[labeled_mask].detach().cpu())
+            pooled_pred_adv.append(pred_clean[labeled_mask].detach().cpu())
+            pooled_logits_clean.append(log_probs_clean[labeled_mask].detach().cpu())
+            pooled_logits_adv.append(log_probs_clean[labeled_mask].detach().cpu())
+            pooled_attack_mask.append(torch.zeros(int(labeled_mask.sum().item()), dtype=torch.bool))
+            pooled_surrogate_pred_clean.append(pred_surrogate_clean[labeled_mask].detach().cpu())
+            pooled_surrogate_pred_adv.append(pred_surrogate_clean[labeled_mask].detach().cpu())
+            pooled_surrogate_logits_clean.append(logits_surrogate_clean[labeled_mask].detach().cpu())
+            pooled_surrogate_logits_adv.append(logits_surrogate_clean[labeled_mask].detach().cpu())
+            continue
 
+        # NETTACK queries only the (stateless) surrogate -- no victim state touched.
         t0 = time.perf_counter()
-        x_view_adv, edge_index_adv, info = atk.attack_slice(
-            x_view, edge_index_curr, y_full, target_global,
-            n_struct=N_STRUCT, eps_feat=EPS_FEAT,
+        x_adv, edge_index_adv, info = atk.attack_slice(
+            x,
+            edge_index,
+            y,
+            targets,
+            n_struct=N_STRUCT,
+            eps_feat=EPS_FEAT,
+            time_step=torch.zeros(x.size(0), dtype=torch.long, device=device),
         )
         attack_time_seconds += float(time.perf_counter() - t0)
         n_unique_added_total += int(info["n_unique_edges_added"])
         n_targets_with_edge_total += int(info["n_targets_with_edge_added"])
 
-        # Reassemble the perturbed window: only the LAST step is modified.
-        x_last_adv = _features_unview(x_view_adv)
-        adj_last_adv = normalize_adj_evolvegcn(edge_index_adv, num_nodes, device)
-        hist_ndFeats_adv = list(hist_ndFeats_list[:-1]) + [x_last_adv]
-        hist_adj_adv = list(hist_adj_list[:-1]) + [adj_last_adv]
-
+        # Restore pre-state, run adv forward.
+        _restore_state(model, snap_pre)
         with torch.no_grad():
-            logits_adv = model(hist_adj_adv, hist_ndFeats_adv, node_mask_list, label_idx).detach()
-            logits_surrogate_adv_full = linearized_surrogate_logits(x_view_adv, edge_index_adv, W)
-        logits_surrogate_adv = logits_surrogate_adv_full[label_idx.long()]
-        pred_adv = logits_adv.argmax(dim=1)
+            log_probs_adv = model(x_adv, edge_index_adv).detach()
+            model.detach_sequence_state()
+            logits_surrogate_adv = linearized_surrogate_logits(
+                x_adv, edge_index_adv, W, structure_mode=STRUCTURE_MODE,
+            )
+        # Restore post-state so the next test timestep continues on the clean trajectory.
+        _restore_state(model, snap_post)
+
+        pred_adv = log_probs_adv.argmax(dim=1)
         pred_surrogate_adv = logits_surrogate_adv.argmax(dim=1)
+        y_lab = y[labeled_mask]
+        pred_clean_lab = pred_clean[labeled_mask]
+        pred_adv_lab = pred_adv[labeled_mask]
+        logits_clean_lab = log_probs_clean[labeled_mask]
+        logits_adv_lab = log_probs_adv[labeled_mask]
+        pred_surrogate_clean_lab = pred_surrogate_clean[labeled_mask]
+        pred_surrogate_adv_lab = pred_surrogate_adv[labeled_mask]
+        logits_surrogate_clean_lab = logits_surrogate_clean[labeled_mask]
+        logits_surrogate_adv_lab = logits_surrogate_adv[labeled_mask]
 
-        attack_mask = torch.zeros(label_idx.numel(), dtype=torch.bool, device=device)
-        attack_mask[target_pos] = True
+        attack_mask_full = torch.zeros(y.numel(), dtype=torch.bool, device=device)
+        attack_mask_full[targets] = True
+        attack_mask_lab = attack_mask_full[labeled_mask]
 
-        asr, ns, na = attack_success_rate(label_vals, pred_clean, pred_adv, attack_mask)
-        asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(label_vals, logits_clean, logits_adv, attack_mask)
+        asr, ns, na = attack_success_rate(y_lab, pred_clean_lab, pred_adv_lab, attack_mask_lab)
+        asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(y_lab, logits_clean_lab, logits_adv_lab, attack_mask_lab)
         surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
-            label_vals, pred_surrogate_clean, pred_surrogate_adv, attack_mask,
+            y_lab, pred_surrogate_clean_lab, pred_surrogate_adv_lab, attack_mask_lab,
         )
         surrogate_asr_p, surrogate_sp, surrogate_ap, surrogate_asr_n, surrogate_sn, surrogate_an = asr_pos_neg(
-            label_vals, logits_surrogate_clean, logits_surrogate_adv, attack_mask,
+            y_lab, logits_surrogate_clean_lab, logits_surrogate_adv_lab, attack_mask_lab,
         )
 
-        full_mask = torch.ones(label_idx.numel(), dtype=torch.bool, device=device)
-        roc_clean = roc_auc_binary(logits_clean, label_vals, full_mask)
-        roc_adv = roc_auc_binary(logits_adv, label_vals, full_mask)
-        clean_m = binary_classification_metrics(label_vals, pred_clean)
-        adv_m = binary_classification_metrics(label_vals, pred_adv)
-        surrogate_clean_m = binary_classification_metrics(label_vals, pred_surrogate_clean)
-        surrogate_adv_m = binary_classification_metrics(label_vals, pred_surrogate_adv)
+        full_mask_lab = torch.ones(y_lab.numel(), dtype=torch.bool, device=device)
+        roc_clean = roc_auc_binary(logits_clean_lab, y_lab, full_mask_lab)
+        roc_adv = roc_auc_binary(logits_adv_lab, y_lab, full_mask_lab)
+        clean_m = binary_classification_metrics(y_lab, pred_clean_lab)
+        adv_m = binary_classification_metrics(y_lab, pred_adv_lab)
+        surrogate_clean_m = binary_classification_metrics(y_lab, pred_surrogate_clean_lab)
+        surrogate_adv_m = binary_classification_metrics(y_lab, pred_surrogate_adv_lab)
 
         conf_drop, n_used = mean_confidence_drop(
-            label_vals, logits_clean, logits_adv, attack_mask, only_clean_correct=True,
+            y_lab, logits_clean_lab, logits_adv_lab, attack_mask_lab, only_clean_correct=True,
         )
 
-        # L2 perturbation on successful flips, on the perturbable column slice.
-        clean_rows = hist_ndFeats_list[-1][target_global, attack_start_col: attack_start_col + attack_dim]
-        adv_rows = x_last_adv[target_global, attack_start_col: attack_start_col + attack_dim]
-        pred_clean_targets = pred_clean[target_pos]
-        pred_adv_targets = pred_adv[target_pos]
-        y_targets = label_vals[target_pos].long()
+        pert_dim = int(info["perturbable_dim"])
+        clean_rows = x[targets, :pert_dim]
+        adv_rows = x_adv[targets, :pert_dim]
+        pred_clean_targets = pred_clean[targets]
+        pred_adv_targets = pred_adv[targets]
+        y_targets = y[targets].long()
         pert_l2_mean, pert_l2_n = mean_perturbation_l2_on_success(
             clean_rows, adv_rows, pred_clean_targets, pred_adv_targets, y_targets,
         )
@@ -344,10 +351,10 @@ def main():
         recall_pos_drop = float(clean_m["recall_pos"] - adv_m["recall_pos"])
         surrogate_f1_pos_drop = float(surrogate_clean_m["f1_pos"] - surrogate_adv_m["f1_pos"])
 
-        per_window.append({
+        per_timestep.append({
             "t": t,
-            "n_labeled": int(label_idx.numel()),
-            "n_targets": int(target_global.numel()),
+            "n_labeled": int(y_lab.numel()),
+            "n_targets": int(targets.numel()),
             "n_unique_edges_added": int(info["n_unique_edges_added"]),
             "n_directed_edges_added": int(info["n_directed_edges_added"]),
             "asr": asr, "asr_success": ns, "asr_attempted": na,
@@ -373,21 +380,21 @@ def main():
             "surrogate_f1_pos_drop": surrogate_f1_pos_drop,
         })
 
-        pooled_y_true.append(label_vals.detach().cpu())
-        pooled_pred_clean.append(pred_clean.detach().cpu())
-        pooled_pred_adv.append(pred_adv.detach().cpu())
-        pooled_logits_clean.append(logits_clean.detach().cpu())
-        pooled_logits_adv.append(logits_adv.detach().cpu())
-        pooled_attack_mask.append(attack_mask.detach().cpu())
-        pooled_surrogate_pred_clean.append(pred_surrogate_clean.detach().cpu())
-        pooled_surrogate_pred_adv.append(pred_surrogate_adv.detach().cpu())
-        pooled_surrogate_logits_clean.append(logits_surrogate_clean.detach().cpu())
-        pooled_surrogate_logits_adv.append(logits_surrogate_adv.detach().cpu())
+        pooled_y_true.append(y_lab.detach().cpu())
+        pooled_pred_clean.append(pred_clean_lab.detach().cpu())
+        pooled_pred_adv.append(pred_adv_lab.detach().cpu())
+        pooled_logits_clean.append(logits_clean_lab.detach().cpu())
+        pooled_logits_adv.append(logits_adv_lab.detach().cpu())
+        pooled_attack_mask.append(attack_mask_lab.detach().cpu())
+        pooled_surrogate_pred_clean.append(pred_surrogate_clean_lab.detach().cpu())
+        pooled_surrogate_pred_adv.append(pred_surrogate_adv_lab.detach().cpu())
+        pooled_surrogate_logits_clean.append(logits_surrogate_clean_lab.detach().cpu())
+        pooled_surrogate_logits_adv.append(logits_surrogate_adv_lab.detach().cpu())
 
         roc_c_show = roc_clean if roc_clean == roc_clean else float("nan")
         roc_a_show = roc_adv if roc_adv == roc_adv else float("nan")
         print(
-            f"t={t:2d}  n_labeled={label_idx.numel():5d}  n_targets={target_global.numel():4d}  "
+            f"t={t:2d}  n_labeled={y_lab.numel():5d}  n_targets={targets.numel():4d}  "
             f"edges+={info['n_unique_edges_added']:3d}  ASR={asr:.4f} ({ns}/{na})  "
             f"F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
             f"ROC {roc_c_show:.3f}->{roc_a_show:.3f}"
@@ -494,10 +501,18 @@ def main():
             "n_struct": N_STRUCT, "eps_feat": EPS_FEAT, "clamp": CLAMP,
             "d_min": D_MIN, "chi2_tau": CHI2_TAU,
             "enforce_degree_constraint": ENFORCE_DEGREE_CONSTRAINT,
+            "structure_mode": STRUCTURE_MODE,
+            "directed_edge_direction": (
+                DIRECTED_EDGE_DIRECTION if STRUCTURE_MODE == "directed" else None
+            ),
+            "degree_constraint_scope": (
+                "in_degree" if STRUCTURE_MODE == "directed" else "undirected_degree"
+            ),
+            "same_timestep_edge_candidates": True,
+            "edge_candidate_scope": "current_timestep_nodes",
             "surrogate_epochs": SURROGATE_EPOCHS,
             "surrogate_lr": SURROGATE_LR,
             "surrogate_weight_decay": SURROGATE_WEIGHT_DECAY,
-            "attack_start_col": attack_start_col,
             "attack_dim": attack_dim,
         },
         "target_selection": {
@@ -524,7 +539,7 @@ def main():
             "attack_time_seconds": attack_time_seconds,
             "aggregate_concat": concat_attack,
         },
-        "per_timestep": per_window,
+        "per_timestep": per_timestep,
         "surrogate": {
             "classification": {
                 "scope": "temporal",

@@ -8,9 +8,13 @@ Adaptations from Zuegner et al. (KDD 2018):
    gradient w.r.t. X[v0] (the surrogate is linear in X, so the optimal direction
    under an L2 budget is g / ||g|| with gain eps_feat * ||g||).
 4. Evasion: model parameters are static; the victim is queried only after the attack.
-5. Direct attack (A = {v_0}); only edges (v_0, u) and X[v_0, :] may be perturbed.
+5. Direct attack (A = {v_0}); only edges adjacent to v_0 and X[v_0, :]
+   may be perturbed. In directed mode, structure additions are incoming
+   edges (u -> v_0), matching PyG's source-to-target message flow.
 6. Edge ADDITIONS only (no deletions).
 7. Power-law chi^2 degree-distribution unnoticeability constraint (Eq. 6-9).
+   Directed mode applies this to in-degree, which is the degree used by
+   PyG GCN normalization.
 8. If node `time_step` metadata is available, structural additions are restricted
    to same-timestep nodes.
 
@@ -48,6 +52,18 @@ def _make_undirected_no_self_loops(edge_index: torch.Tensor, num_nodes: int) -> 
     return torch.stack([new_row, new_col], dim=0)
 
 
+def _make_directed_no_self_loops(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Return deduplicated directed edges without self-loops, shape (2, |E|)."""
+    row, col = edge_index[0].long(), edge_index[1].long()
+    mask = row != col
+    row, col = row[mask], col[mask]
+    keys = row * num_nodes + col
+    unique_keys = torch.unique(keys)
+    new_row = unique_keys // num_nodes
+    new_col = unique_keys % num_nodes
+    return torch.stack([new_row, new_col], dim=0)
+
+
 def _build_A_hat(
     edges_no_sl: torch.Tensor, num_nodes: int, device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -70,6 +86,32 @@ def _build_A_hat(
     return A_hat, deg_tilde
 
 
+def _build_A_hat_directed(
+    edges_no_sl: torch.Tensor, num_nodes: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build directed PyG-GCN normalization as a sparse row-aggregation matrix.
+
+    `edges_no_sl` follows PyG edge_index convention: source -> target. The
+    returned sparse matrix has entries A_hat[target, source], so
+    `torch.sparse.mm(A_hat, x)` aggregates incoming source messages into target
+    rows. Degrees are target-side in-degrees plus self-loops, mirroring
+    `torch_geometric.nn.conv.gcn_conv.gcn_norm(..., flow="source_to_target")`.
+    """
+    N = num_nodes
+    src = edges_no_sl[0].long()
+    dst = edges_no_sl[1].long()
+    sl = torch.arange(N, device=device, dtype=torch.long)
+    full_src = torch.cat([src, sl])
+    full_dst = torch.cat([dst, sl])
+    deg_tilde = torch.zeros(N, device=device, dtype=torch.float)
+    deg_tilde.scatter_add_(0, full_dst, torch.ones_like(full_dst, dtype=torch.float))
+    inv_sqrt = deg_tilde.clamp(min=1.0).pow(-0.5)
+    values = inv_sqrt[full_src] * inv_sqrt[full_dst]
+    indices = torch.stack([full_dst, full_src], dim=0)
+    A_hat = torch.sparse_coo_tensor(indices, values, (N, N)).coalesce()
+    return A_hat, deg_tilde
+
+
 class AdaptedNettackAttack(BaseAttack):
     """Adapted NETTACK driver matching the FGSM / PGD scaffolding.
 
@@ -84,6 +126,8 @@ class AdaptedNettackAttack(BaseAttack):
       eps_feat                  : per-target L2 budget for the closed-form feature step.
       d_min, chi2_tau           : power-law chi^2 test parameters (paper defaults 2, 0.004).
       enforce_degree_constraint : if False, skip the chi^2 filter on edge candidates.
+      structure_mode            : "undirected" (paper-style) or "directed" (static Elliptic-style).
+      directed_edge_direction   : currently only "incoming_to_target" is supported.
     """
 
     def __init__(
@@ -101,10 +145,20 @@ class AdaptedNettackAttack(BaseAttack):
         surrogate_lr: float = 0.01,
         surrogate_weight_decay: float = 5e-4,
         pretrained_W: Optional[torch.Tensor] = None,
+        structure_mode: str = "undirected",
+        directed_edge_direction: str = "incoming_to_target",
         verbose: bool = False,
         progress_every: int = 100,
     ):
         super().__init__(model, data, device)
+        if structure_mode not in {"undirected", "directed"}:
+            raise ValueError("structure_mode must be 'undirected' or 'directed'.")
+        if directed_edge_direction != "incoming_to_target":
+            raise ValueError(
+                "Only directed_edge_direction='incoming_to_target' is supported."
+            )
+        self.structure_mode = structure_mode
+        self.directed_edge_direction = directed_edge_direction
         self.x = data.x.to(device).detach().clone()
         self.y = data.y.to(device).long()
         self.edge_index_orig = data.edge_index.to(device).clone()
@@ -128,12 +182,19 @@ class AdaptedNettackAttack(BaseAttack):
         self.verbose = bool(verbose)
         self.progress_every = int(progress_every)
 
-        # Symmetrized clean adjacency used by the surrogate (NETTACK assumes undirected).
-        self.edges_no_sl_orig = _make_undirected_no_self_loops(self.edge_index_orig, self.N)
+        if self.structure_mode == "undirected":
+            self.edges_no_sl_orig = _make_undirected_no_self_loops(self.edge_index_orig, self.N)
+        else:
+            self.edges_no_sl_orig = _make_directed_no_self_loops(self.edge_index_orig, self.N)
         deg_orig = torch.zeros(self.N, device=device, dtype=torch.long)
+        deg_index = (
+            self.edges_no_sl_orig[0]
+            if self.structure_mode == "undirected"
+            else self.edges_no_sl_orig[1]
+        )
         deg_orig.scatter_add_(
-            0, self.edges_no_sl_orig[0],
-            torch.ones_like(self.edges_no_sl_orig[0], dtype=torch.long),
+            0, deg_index,
+            torch.ones_like(deg_index, dtype=torch.long),
         )
         self.deg_orig = deg_orig
 
@@ -160,10 +221,15 @@ class AdaptedNettackAttack(BaseAttack):
             )
 
     # ---------- surrogate ----------
+    def _build_surrogate_A_hat(self, edges_no_sl: torch.Tensor):
+        if self.structure_mode == "directed":
+            return _build_A_hat_directed(edges_no_sl, self.N, self.device)
+        return _build_A_hat(edges_no_sl, self.N, self.device)
+
     def _train_surrogate(self, edges_no_sl, *, epochs, lr, weight_decay):
         """Train W in R^{D x K} for Z = softmax(A_hat^2 X W) on the clean graph."""
         device = self.device
-        A_hat, _ = _build_A_hat(edges_no_sl, self.N, device)
+        A_hat, _ = self._build_surrogate_A_hat(edges_no_sl)
         AX = torch.sparse.mm(A_hat, self.x)
         AAX = torch.sparse.mm(A_hat, AX)
         D = self.x.size(1)
@@ -272,6 +338,49 @@ class AdaptedNettackAttack(BaseAttack):
         Lambda = -2.0 * l_comb + 2.0 * (self._l_orig + l_new)
         return Lambda < self.chi2_tau
 
+    def _chi2_filter_directed_incoming_additions(
+        self, v0: int, candidates: torch.Tensor, deg_curr: torch.Tensor
+    ) -> torch.Tensor:
+        """Directed mode chi^2 filter for adding u -> v0.
+
+        Only v0's in-degree changes under the directed surrogate and victim
+        edge_index convention used by the static drivers.
+        """
+        if candidates.numel() == 0:
+            return torch.empty(0, device=self.device, dtype=torch.bool)
+
+        n_curr, R_curr, _, _ = self._powerlaw_stats(deg_curr)
+        d_min = self.d_min
+        d_v0 = float(deg_curr[v0].item())
+        if d_v0 >= d_min:
+            dn_v0 = 0.0
+            dR_v0 = math.log(d_v0 + 1.0) - math.log(d_v0)
+        elif d_v0 == d_min - 1:
+            dn_v0 = 1.0
+            dR_v0 = math.log(d_v0 + 1.0)
+        else:
+            dn_v0 = 0.0
+            dR_v0 = 0.0
+
+        n_new = torch.full(
+            (candidates.numel(),),
+            float(n_curr + dn_v0),
+            device=self.device,
+            dtype=torch.float,
+        )
+        R_new = torch.full(
+            (candidates.numel(),),
+            float(R_curr + dR_v0),
+            device=self.device,
+            dtype=torch.float,
+        )
+        l_new = self._vec_l_from_n_R(n_new, R_new)
+        n_comb = self._n_orig + n_new
+        R_comb = self._R_orig + R_new
+        l_comb = self._vec_l_from_n_R(n_comb, R_comb)
+        Lambda = -2.0 * l_comb + 2.0 * (self._l_orig + l_new)
+        return Lambda < self.chi2_tau
+
     # ---------- attack ----------
     def attack(
         self,
@@ -281,9 +390,9 @@ class AdaptedNettackAttack(BaseAttack):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run adapted NETTACK on each target. Returns (x_adv, edge_index_adv).
 
-        edge_index_adv contains the original edge_index with new edges appended
-        in BOTH directions (NETTACK is undirected -- per-edge add inserts (v0, u)
-        and (u, v0)). Original edges are preserved verbatim.
+        In undirected mode, each structural perturbation appends both directions
+        to edge_index. In directed mode, each structural perturbation appends one
+        incoming edge u -> target. Original edges are preserved verbatim.
         """
         if not torch.is_tensor(target_nodes):
             target_nodes = torch.tensor(target_nodes, dtype=torch.long)
@@ -303,6 +412,7 @@ class AdaptedNettackAttack(BaseAttack):
         self._edges_curr = self.edges_no_sl_orig.clone()
         self._deg_curr = self.deg_orig.clone()
         self._added_edges: list[tuple[int, int]] = []
+        self._added_edge_target_nodes: list[int] = []
 
         n_targets = int(target_nodes.numel())
         for i, v0 in enumerate(target_nodes.tolist()):
@@ -313,7 +423,7 @@ class AdaptedNettackAttack(BaseAttack):
                     f"edges added so far={len(self._added_edges)}"
                 )
 
-        # Build output edge_index: original + symmetric additions.
+        # Build output edge_index: original + new structural additions.
         edge_index_adv = self._build_output_edge_index()
         x_adv = self._x_curr
         if self.clamp is not None:
@@ -321,17 +431,26 @@ class AdaptedNettackAttack(BaseAttack):
         return x_adv, edge_index_adv
 
     def _build_output_edge_index(self) -> torch.Tensor:
-        """Original edge_index plus all new edges added during the attack (both directions)."""
+        """Original edge_index plus all new structural additions."""
         device = self.device
         if not self._added_edges:
             return self.edge_index_orig.clone()
         added = torch.tensor(self._added_edges, device=device, dtype=self.edge_index_orig.dtype)
+        if self.structure_mode == "directed":
+            return torch.cat([self.edge_index_orig, added.t()], dim=1)
+
         # added has shape (M, 2) with entries (v0, u). Add both directions.
         forward = added.t()  # (2, M)
         backward = torch.stack([added[:, 1], added[:, 0]], dim=0)
         return torch.cat([self.edge_index_orig, forward, backward], dim=1)
 
     def _attack_single_target(self, v0: int, n_struct: int, eps_feat: float):
+        if self.structure_mode == "directed":
+            self._attack_single_target_directed(v0, n_struct, eps_feat)
+            return
+        self._attack_single_target_undirected(v0, n_struct, eps_feat)
+
+    def _attack_single_target_undirected(self, v0: int, n_struct: int, eps_feat: float):
         """Mutates self._x_curr, self._edges_curr, self._deg_curr, self._added_edges."""
         device = self.device
         N = self.N
@@ -341,7 +460,7 @@ class AdaptedNettackAttack(BaseAttack):
 
         while edges_used < n_struct or not feat_used:
             # Recompute surrogate quantities on the running state.
-            A_hat, d_tilde = _build_A_hat(self._edges_curr, N, device)
+            A_hat, d_tilde = self._build_surrogate_A_hat(self._edges_curr)
             C = self._x_curr @ self.W
             M = torch.sparse.mm(A_hat, C)
             Z = torch.sparse.mm(A_hat, M)
@@ -414,10 +533,177 @@ class AdaptedNettackAttack(BaseAttack):
                 self._deg_curr[v0] = self._deg_curr[v0] + 1
                 self._deg_curr[u] = self._deg_curr[u] + 1
                 self._added_edges.append((v0, u))
+                self._added_edge_target_nodes.append(v0)
                 edges_used += 1
             else:
                 # No improving action available -- stop attacking this target.
                 break
+
+    def _attack_single_target_directed(self, v0: int, n_struct: int, eps_feat: float):
+        """Directed static variant: structural additions are u -> v0."""
+        device = self.device
+        N = self.N
+
+        feat_used = False
+        edges_used = 0
+
+        while edges_used < n_struct or not feat_used:
+            A_hat, d_tilde = self._build_surrogate_A_hat(self._edges_curr)
+            C = self._x_curr @ self.W
+            M = torch.sparse.mm(A_hat, C)
+            Z = torch.sparse.mm(A_hat, M)
+            L_clean = float((Z[v0, 0] - Z[v0, 1]).item())
+
+            best_edge_score = -float("inf")
+            best_edge_u: Optional[int] = None
+
+            src = self._edges_curr[0]
+            dst = self._edges_curr[1]
+            incoming_sources = src[dst == v0].long()
+            has_incoming = torch.zeros(N, device=device, dtype=torch.bool)
+            has_incoming[incoming_sources] = True
+            cand_mask = ~has_incoming
+            cand_mask[v0] = False
+            if self.time_step is not None:
+                cand_mask &= self.time_step == self.time_step[v0]
+
+            if edges_used < n_struct:
+                candidates = torch.where(cand_mask)[0]
+                if candidates.numel() > 0:
+                    scores = self._score_directed_incoming_edge_additions(
+                        v0, candidates, d_tilde, C, M, L_clean,
+                        incoming_sources, src, dst,
+                    )
+                    if self.enforce_degree_constraint:
+                        valid = self._chi2_filter_directed_incoming_additions(
+                            v0, candidates, self._deg_curr,
+                        )
+                        scores = torch.where(
+                            valid, scores, torch.full_like(scores, -float("inf"))
+                        )
+                    if torch.isfinite(scores).any():
+                        idx = torch.argmax(scores)
+                        best_edge_score = float(scores[idx].item())
+                        best_edge_u = int(candidates[idx].item())
+
+            feat_score = -float("inf")
+            feat_g = None
+            if not feat_used:
+                A2_v0_v0 = self._directed_A2_diag_entry(v0, d_tilde, incoming_sources, src, dst)
+                w_diff = self.W[: self.attack_dim, 0] - self.W[: self.attack_dim, 1]
+                feat_g = A2_v0_v0 * w_diff
+                g_norm = float(feat_g.norm().item())
+                if g_norm > 0:
+                    feat_score = eps_feat * g_norm
+
+            if (not feat_used) and feat_score > best_edge_score and feat_score > 0.0:
+                g_norm = float(feat_g.norm().item())
+                step = (eps_feat / max(g_norm, 1e-12)) * feat_g
+                self._x_curr[v0, : self.attack_dim] = (
+                    self._x_curr[v0, : self.attack_dim] + step
+                )
+                if self.rebuild_fn is not None:
+                    self._x_curr = self.rebuild_fn(self._x_curr)
+                feat_used = True
+            elif edges_used < n_struct and best_edge_u is not None and best_edge_score > -float("inf"):
+                u = best_edge_u
+                new_edge = torch.tensor(
+                    [[u], [v0]], device=device, dtype=self._edges_curr.dtype
+                )
+                self._edges_curr = torch.cat([self._edges_curr, new_edge], dim=1)
+                self._deg_curr[v0] = self._deg_curr[v0] + 1
+                self._added_edges.append((u, v0))
+                self._added_edge_target_nodes.append(v0)
+                edges_used += 1
+            else:
+                break
+
+    def _directed_out_weight_from_v(
+        self, v0: int, d_tilde: torch.Tensor, src: torch.Tensor, dst: torch.Tensor
+    ) -> torch.Tensor:
+        """Return vector w[r] = A_hat[r, v0] for existing directed edge v0 -> r."""
+        out_weight = torch.zeros(self.N, device=self.device, dtype=torch.float)
+        out_targets = dst[src == v0].long()
+        if out_targets.numel() > 0:
+            out_weight[out_targets] = 1.0 / torch.sqrt(d_tilde[out_targets] * d_tilde[v0])
+        return out_weight
+
+    def _directed_A2_diag_entry(
+        self,
+        v0: int,
+        d_tilde: torch.Tensor,
+        incoming_sources: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        d_v = d_tilde[v0]
+        out_weight = self._directed_out_weight_from_v(v0, d_tilde, src, dst)
+        a2 = 1.0 / (d_v * d_v)
+        if incoming_sources.numel() > 0:
+            in_weight = 1.0 / torch.sqrt(d_v * d_tilde[incoming_sources])
+            a2 = a2 + (in_weight * out_weight[incoming_sources]).sum()
+        return a2
+
+    def _score_directed_incoming_edge_additions(
+        self,
+        v0: int,
+        candidates: torch.Tensor,
+        d_tilde: torch.Tensor,
+        C: torch.Tensor,
+        M: torch.Tensor,
+        L_clean: float,
+        incoming_sources: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact vectorized score for directed additions u -> v0.
+
+        The directed surrogate uses A_hat[target, source] and target-side
+        in-degree normalization. Adding u -> v0 changes v0's in-degree, row v0,
+        and all existing outgoing weights from v0 because v0 is also a source
+        endpoint in those normalized weights.
+        """
+        d_v = d_tilde[v0]
+        d_v_new = d_v + 1.0
+        gamma = torch.sqrt(d_v / d_v_new)
+        self_weight_old = 1.0 / d_v
+        self_weight_new = 1.0 / d_v_new
+        C_v = C[v0]
+
+        out_weight = self._directed_out_weight_from_v(v0, d_tilde, src, dst)
+
+        # Row v0 after only the degree-rescaling part of the directed addition.
+        M_v_base_new = (
+            gamma * (M[v0] - self_weight_old * C_v)
+            + self_weight_new * C_v
+        )
+
+        base = self_weight_new * M_v_base_new
+        if incoming_sources.numel() > 0:
+            in_weight_old = 1.0 / torch.sqrt(d_v * d_tilde[incoming_sources])
+            in_weight_new = gamma * in_weight_old
+            delta_m_in = (
+                (gamma - 1.0)
+                * out_weight[incoming_sources].unsqueeze(1)
+                * C_v.unsqueeze(0)
+            )
+            M_in_new = M[incoming_sources] + delta_m_in
+            base = base + (in_weight_new.unsqueeze(1) * M_in_new).sum(dim=0)
+
+        candidate_weight = 1.0 / torch.sqrt(d_v_new * d_tilde[candidates])
+        delta_m_candidates = (
+            (gamma - 1.0)
+            * out_weight[candidates].unsqueeze(1)
+            * C_v.unsqueeze(0)
+        )
+        candidate_term = candidate_weight.unsqueeze(1) * (
+            M[candidates]
+            + delta_m_candidates
+            + self_weight_new * C[candidates]
+        )
+        z_prime_v0 = base.unsqueeze(0) + candidate_term
+        L_new = z_prime_v0[:, 0] - z_prime_v0[:, 1]
+        return L_new - L_clean
 
     def _score_edge_additions(
         self,
