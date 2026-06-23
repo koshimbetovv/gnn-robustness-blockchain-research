@@ -7,6 +7,13 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from scripts.adapted_nettack_pertarget_utils import (
+    diagnostics_summary,
+    perturbation_summary,
+    summarize_per_target_entries,
+    target_outcome_branch,
+    transfer_summary,
+)
 from src.datasets.elliptic import EllipticDataset, EllipticConfig
 from src.datasets.ellipticpp_actors import EllipticPPActorsDataset, EllipticPPActorsConfig
 from src.attacks.nettack_adapted import (
@@ -20,14 +27,13 @@ from src.attacks.model_forward import forward_logits, STATIC_MODELS
 from src.utils.model_loader import load_model
 from src.utils.seed import set_seed
 from src.training.metrics import (
-    get_split_mask, evaluate_logits_on_split, attack_success_rate,
-    roc_auc_binary, mean_confidence_drop, asr_pos_neg,
-    mean_perturbation_l2_on_success, binary_classification_metrics,
+    get_split_mask, evaluate_logits_on_split,
+    roc_auc_binary, mean_confidence_drop,
 )
 from src.utils.attack_targets import pick_target_nodes
 
 # ---------- attack parameters ----------
-MODEL_NAME = "gcn"          # "gcn", "graphsage", "gat", "chronowave_gnn"
+MODEL_NAME = "graphsage"          # "gcn", "graphsage", "gat", "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"  # "models/Elliptic" or "models/Elliptic++"
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -62,13 +68,14 @@ SURROGATE_WEIGHT_DECAY = 5e-4
 # ---------- target selection controls ----------
 # Adapted NETTACK is binary illicit -> licit, so always attack only illicit nodes.
 ATTACK_ONLY_ILLICIT = True
-ATTACK_FRACTION = 1.0
+ATTACK_FRACTION = 0.2
 ONLY_CLEAN_CORRECT = False
 SEED = 0
 
 # Progress logging across independent per-target runs.
 VERBOSE = True
 PROGRESS_EVERY = 50
+SAVE_PER_TARGET_DETAILS = False
 
 
 def get_device():
@@ -200,11 +207,12 @@ def main():
         print("No eligible target nodes found for the chosen settings.")
         return
 
-    clean_m_split = evaluate_logits_on_split(logits_clean, data.y, split_mask, SPLIT)
-    roc_clean_split = roc_auc_binary(logits_clean, data.y, split_mask)
-    surrogate_clean_m_split = evaluate_logits_on_split(
+    clean_labeled_m = evaluate_logits_on_split(logits_clean, data.y, split_mask, SPLIT)
+    roc_clean_labeled = roc_auc_binary(logits_clean, data.y, split_mask)
+    surrogate_clean_labeled_m = evaluate_logits_on_split(
         logits_surrogate_clean, data.y, split_mask, SPLIT,
     )
+    surrogate_roc_clean_labeled = roc_auc_binary(logits_surrogate_clean, data.y, split_mask)
 
     print(f"Selected {int(targets.numel())} targets for independent per-target NETTACK runs.")
 
@@ -218,15 +226,12 @@ def main():
     target_pred_surrogate_adv = []
     target_logits_surrogate_clean = []
     target_logits_surrogate_adv = []
-    clean_rows = []
-    adv_rows = []
     split_adv_f1_pos = []
     split_adv_recall_pos = []
     split_adv_f1_macro = []
     split_adv_roc_auc = []
 
     n_edges_orig = int(data.edge_index.size(1))
-    n_unique_added_total = 0
     n_directed_added_total = 0
     n_targets_with_edge_total = 0
     attack_time_seconds = 0.0
@@ -254,11 +259,8 @@ def main():
         split_adv_roc_auc.append(roc_adv_split)
 
         n_edges_adv = int(edge_index_adv.size(1))
-        added_edges = list(getattr(atk, "_added_edges", []))
-        n_unique_added = len(added_edges)
         n_directed_added = n_edges_adv - n_edges_orig
         n_targets_with_edge = len(set(getattr(atk, "_added_edge_target_nodes", [])))
-        n_unique_added_total += n_unique_added
         n_directed_added_total += n_directed_added
         n_targets_with_edge_total += n_targets_with_edge
 
@@ -289,8 +291,6 @@ def main():
         target_pred_surrogate_adv.append(pred_surrogate_adv)
         target_logits_surrogate_clean.append(logits_surrogate_clean[target].detach().cpu())
         target_logits_surrogate_adv.append(logits_surrogate_adv[target].detach().cpu())
-        clean_rows.append(clean_row.detach().cpu())
-        adv_rows.append(adv_row.detach().cpu())
 
         per_target.append({
             "target": int(target),
@@ -318,7 +318,6 @@ def main():
                 "n_edges_orig": n_edges_orig,
                 "n_edges_adv": n_edges_adv,
                 "n_directed_edges_added": n_directed_added,
-                "n_unique_edges_added": n_unique_added,
                 "n_targets_with_edge_added": n_targets_with_edge,
             },
             "split_adv_metrics": {
@@ -332,7 +331,7 @@ def main():
         if VERBOSE and ((i + 1) == 1 or (i + 1) % PROGRESS_EVERY == 0 or (i + 1) == targets.numel()):
             print(
                 f"  [adapted-nettack-pertarget] {i + 1}/{int(targets.numel())} targets done; "
-                f"last_target={int(target)} success={bool(success)} edges+={n_unique_added}"
+                f"last_target={int(target)} success={bool(success)} edges+={n_directed_added}"
             )
 
     y_t = torch.tensor(target_y, dtype=torch.long)
@@ -344,37 +343,76 @@ def main():
     pred_surrogate_adv_t = torch.tensor(target_pred_surrogate_adv, dtype=torch.long)
     logits_surrogate_clean_t = torch.stack(target_logits_surrogate_clean, dim=0)
     logits_surrogate_adv_t = torch.stack(target_logits_surrogate_adv, dim=0)
-    clean_rows_t = torch.stack(clean_rows, dim=0)
-    adv_rows_t = torch.stack(adv_rows, dim=0)
     target_mask = torch.ones(y_t.numel(), dtype=torch.bool)
+    per_target_summary = summarize_per_target_entries(per_target)
 
-    target_clean_m = binary_classification_metrics(y_t, pred_clean_t)
-    target_adv_m = binary_classification_metrics(y_t, pred_adv_t)
-    target_roc_clean = roc_auc_binary(logits_clean_t, y_t, target_mask)
-    target_roc_adv = roc_auc_binary(logits_adv_t, y_t, target_mask)
-    asr, ns, na = attack_success_rate(y_t, pred_clean_t, pred_adv_t, target_mask)
-    asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(y_t, logits_clean_t, logits_adv_t, target_mask)
     conf_drop, n_used = mean_confidence_drop(
         y_t, logits_clean_t, logits_adv_t, target_mask, only_clean_correct=True
     )
-    pert_l2_mean, pert_l2_n = mean_perturbation_l2_on_success(
-        clean_rows_t, adv_rows_t, pred_clean_t, pred_adv_t, y_t,
-    )
 
-    surrogate_target_clean_m = binary_classification_metrics(y_t, pred_surrogate_clean_t)
-    surrogate_target_adv_m = binary_classification_metrics(y_t, pred_surrogate_adv_t)
-    surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
-        y_t, pred_surrogate_clean_t, pred_surrogate_adv_t, target_mask,
-    )
-    surrogate_asr_p, surrogate_sp, surrogate_ap, surrogate_asr_n, surrogate_sn, surrogate_an = asr_pos_neg(
-        y_t, logits_surrogate_clean_t, logits_surrogate_adv_t, target_mask,
-    )
     surrogate_conf_drop, surrogate_n_used = mean_confidence_drop(
         y_t, logits_surrogate_clean_t, logits_surrogate_adv_t, target_mask, only_clean_correct=True
     )
 
+    victim_outcome = target_outcome_branch(
+        y=y_t,
+        pred_clean=pred_clean_t,
+        pred_adv=pred_adv_t,
+        logits_clean=logits_clean_t,
+        logits_adv=logits_adv_t,
+        summary=per_target_summary["victim"],
+        confidence_drop_value=conf_drop,
+        confidence_drop_n=n_used,
+    )
+    surrogate_outcome = target_outcome_branch(
+        y=y_t,
+        pred_clean=pred_surrogate_clean_t,
+        pred_adv=pred_surrogate_adv_t,
+        logits_clean=logits_surrogate_clean_t,
+        logits_adv=logits_surrogate_adv_t,
+        summary=per_target_summary["surrogate"],
+        confidence_drop_value=surrogate_conf_drop,
+        confidence_drop_n=surrogate_n_used,
+    )
+    target_outcome = {
+        "n_targets": int(targets.numel()),
+        "victim": victim_outcome,
+        "surrogate": surrogate_outcome,
+        "transfer": transfer_summary(
+            y=y_t,
+            victim_pred_clean=pred_clean_t,
+            victim_pred_adv=pred_adv_t,
+            surrogate_pred_clean=pred_surrogate_clean_t,
+            surrogate_pred_adv=pred_surrogate_adv_t,
+            victim_asr=victim_outcome["asr"],
+            surrogate_asr=surrogate_outcome["asr"],
+        ),
+    }
+    perturbation = perturbation_summary(
+        per_target_summary=per_target_summary,
+        structure={
+            "mode": "independent_per_target_sum",
+            "n_edges_orig_per_run": n_edges_orig,
+            "n_directed_edges_added_total": n_directed_added_total,
+            "n_targets_with_edge_added_total": n_targets_with_edge_total,
+            "mean_directed_edges_per_target": (
+                float(n_directed_added_total) / float(targets.numel())
+                if targets.numel() > 0 else 0.0
+            ),
+        },
+    )
+    diagnostics = diagnostics_summary(per_target_summary)
+
     print()
     run_dir, ts = make_run_dir(MODEL_NAME)
+    clean_labeled_summary = {
+        **vars(clean_labeled_m),
+        "roc_auc": roc_clean_labeled,
+    }
+    surrogate_clean_labeled_summary = {
+        **vars(surrogate_clean_labeled_m),
+        "roc_auc": surrogate_roc_clean_labeled,
+    }
     config = {
         "timestamp": ts,
         "attack": "AdaptedNETTACKPerTarget",
@@ -388,6 +426,14 @@ def main():
             "description": (
                 "Each selected target is attacked from the clean graph independently; "
                 "there is no single cumulative adversarial graph."
+            ),
+        },
+        "outputs": {
+            "metrics": "metrics.json",
+            "config": "config.json",
+            "save_per_target_details": SAVE_PER_TARGET_DETAILS,
+            "per_target_details": (
+                "per_target_details.json" if SAVE_PER_TARGET_DETAILS else None
             ),
         },
         "attack_params": {
@@ -426,109 +472,36 @@ def main():
         "dataset": DATASET,
         "classification": {
             "scope": "static_independent_per_target",
-            "clean_split": {
-                "split": SPLIT,
-                "roc_auc": roc_clean_split,
-                "metrics": vars(clean_m_split),
+            "victim": {
+                "labeled_clean": clean_labeled_summary,
+                "labeled_adv_independent_mean": {
+                    "n_runs": int(targets.numel()),
+                    "f1_pos": _nanmean(split_adv_f1_pos),
+                    "recall_pos": _nanmean(split_adv_recall_pos),
+                    "f1_macro": _nanmean(split_adv_f1_macro),
+                    "roc_auc": _nanmean(split_adv_roc_auc),
+                },
             },
-            "adv_split_independent_mean": {
-                "n_runs": int(targets.numel()),
-                "f1_pos": _nanmean(split_adv_f1_pos),
-                "recall_pos": _nanmean(split_adv_recall_pos),
-                "f1_macro": _nanmean(split_adv_f1_macro),
-                "roc_auc": _nanmean(split_adv_roc_auc),
-            },
-            "target_only": {
-                "n": int(y_t.numel()),
-                "f1_pos": {
-                    "clean": target_clean_m["f1_pos"],
-                    "adv": target_adv_m["f1_pos"],
-                    "drop": float(target_clean_m["f1_pos"] - target_adv_m["f1_pos"]),
-                },
-                "recall_pos": {
-                    "clean": target_clean_m["recall_pos"],
-                    "adv": target_adv_m["recall_pos"],
-                    "drop": float(target_clean_m["recall_pos"] - target_adv_m["recall_pos"]),
-                },
-                "f1_macro": {
-                    "clean": target_clean_m["f1_macro"],
-                    "adv": target_adv_m["f1_macro"],
-                    "drop": float(target_clean_m["f1_macro"] - target_adv_m["f1_macro"]),
-                },
-                "roc_auc": {"clean": target_roc_clean, "adv": target_roc_adv},
-                "clean_metrics": target_clean_m,
-                "adv_metrics": target_adv_m,
+            "surrogate": {
+                "labeled_clean": surrogate_clean_labeled_summary,
             },
         },
-        "attack_effect": {
-            "n_targets": int(targets.numel()),
-            "attack_time_seconds": attack_time_seconds,
-            "asr": {"value": asr, "success": ns, "attempted": na},
-            "asr_pos_neg": {
-                "asr_pos": asr_p, "succ_pos": sp, "attempted_pos": ap,
-                "asr_neg": asr_n, "succ_neg": sn, "attempted_neg": an,
-            },
-            "mean_confidence_drop": {"value": conf_drop, "n": n_used},
-            "perturbation_l2_on_success": {"value": pert_l2_mean, "n_flipped": pert_l2_n},
-            "structural": {
-                "mode": "independent_per_target_sum",
-                "n_edges_orig_per_run": n_edges_orig,
-                "n_directed_edges_added_total": n_directed_added_total,
-                "n_unique_edges_added_total": n_unique_added_total,
-                "n_targets_with_edge_added_total": n_targets_with_edge_total,
-                "mean_unique_edges_per_target": (
-                    float(n_unique_added_total) / float(targets.numel())
-                    if targets.numel() > 0 else 0.0
-                ),
-            },
-        },
-        "surrogate": {
-            "classification": {
-                "clean_split": {
-                    "split": SPLIT,
-                    "metrics": vars(surrogate_clean_m_split),
-                },
-                "target_only": {
-                    "n": int(y_t.numel()),
-                    "f1_pos": {
-                        "clean": surrogate_target_clean_m["f1_pos"],
-                        "adv": surrogate_target_adv_m["f1_pos"],
-                        "drop": float(
-                            surrogate_target_clean_m["f1_pos"] - surrogate_target_adv_m["f1_pos"]
-                        ),
-                    },
-                    "clean_metrics": surrogate_target_clean_m,
-                    "adv_metrics": surrogate_target_adv_m,
-                },
-            },
-            "attack_effect": {
-                "asr": {
-                    "value": surrogate_asr,
-                    "success": surrogate_ns,
-                    "attempted": surrogate_na,
-                },
-                "asr_pos_neg": {
-                    "asr_pos": surrogate_asr_p,
-                    "succ_pos": surrogate_sp,
-                    "attempted_pos": surrogate_ap,
-                    "asr_neg": surrogate_asr_n,
-                    "succ_neg": surrogate_sn,
-                    "attempted_neg": surrogate_an,
-                },
-                "mean_confidence_drop": {
-                    "value": surrogate_conf_drop,
-                    "n": surrogate_n_used,
-                },
-            },
-        },
-        "per_target": per_target,
+        "target_outcome": target_outcome,
+        "perturbation": perturbation,
+        "diagnostics": diagnostics,
+        "runtime": {"attack_time_seconds": attack_time_seconds},
     }
     write_json(os.path.join(run_dir, "metrics.json"), metrics)
+    if SAVE_PER_TARGET_DETAILS:
+        write_json(os.path.join(run_dir, "per_target_details.json"), per_target)
 
+    asr_obj = victim_outcome["asr"]
+    asr_text = "nan" if asr_obj["value"] is None else f"{asr_obj['value']:.4f}"
     print(
-        f"Per-target ASR={asr:.4f} ({ns}/{na})  "
+        f"Per-target ASR={asr_text} "
+        f"({asr_obj['success']}/{asr_obj['attempted_clean_correct']})  "
         f"targets={int(targets.numel())}  "
-        f"mean_edges/target={metrics['attack_effect']['structural']['mean_unique_edges_per_target']:.2f}"
+        f"mean_edges/target={metrics['perturbation']['structure']['directed_edges_added']['mean_per_target']:.2f}"
     )
     print(f"Saved to {os.path.relpath(run_dir, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))}")
 

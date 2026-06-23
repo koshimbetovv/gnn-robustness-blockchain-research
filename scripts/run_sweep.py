@@ -34,9 +34,9 @@ ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
     },
     "adapted_nettack": {
         "static": "scripts/run_adapted_nettack_attack_pertarget.py",
-        "recgnn": "scripts/run_adapted_nettack_attack_recgnn.py",
-        "evolvegcn_o": "scripts/run_adapted_nettack_attack_evolvegcn.py",
-        "cosemignn": "scripts/run_adapted_nettack_attack_cosemignn.py",
+        "recgnn": "scripts/run_adapted_nettack_attack_recgnn_pertarget.py",
+        "evolvegcn_o": "scripts/run_adapted_nettack_attack_evolvegcn_pertarget.py",
+        "cosemignn": "scripts/run_adapted_nettack_attack_cosemignn_pertarget.py",
     },
     "tdgia": {
         "static": "scripts/run_tdgia_attack.py",

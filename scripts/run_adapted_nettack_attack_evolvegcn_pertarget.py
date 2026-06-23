@@ -8,15 +8,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from scripts.adapted_nettack_pertarget_utils import (
     PerTargetResults,
+    labeled_logits_summary,
     make_pertarget_run_dir,
     write_json,
 )
-from scripts.run_adapted_nettack_attack_evolvegcn import (
-    _active_slice_marker,
-    _build_y_full,
-    edge_index_from_normalized_adj,
-    normalize_adj_evolvegcn,
-)
+
 from scripts.training.train_evolvegcn_utils import build_evolvegcn_model, move_sample
 from src.datasets.evolvegcn_elliptic import EvolveGCNEllipticConfig, EvolveGCNEllipticDataset
 from src.datasets.evolvegcn_ellipticpp_actors import (
@@ -72,24 +68,104 @@ ATTACK_START_COL = None
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
-ATTACK_FRACTION = 1.0
+ATTACK_FRACTION = 0.2
 ONLY_CLEAN_CORRECT = False
 SEED = 0
 
 VERBOSE = True
 PROGRESS_EVERY = 100
+SAVE_PER_TARGET_DETAILS = False
 
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
+    #if torch.backends.mps.is_available():
+    #    return torch.device("mps")
     return torch.device("cpu")
 
 
 def _entries_asr(entries, branch: str):
     attempted = sum(1 for item in entries if item[branch]["clean_correct"])
     success = sum(1 for item in entries if item[branch]["success"])
-    return (float(success) / float(attempted) if attempted else 0.0, success, attempted)
+    return (float(success) / float(attempted) if attempted else None, success, attempted)
+
+def edge_index_from_normalized_adj(
+    adj_sparse: torch.Tensor,
+    structure_mode: str,
+) -> torch.Tensor:
+    """Recover attack-facing edge_index from EvolveGCN's normalized adjacency.
+
+    The victim stores a row-aggregation matrix and computes `Ahat.matmul(XW)`.
+    In directed mode we expose this to NETTACK as source -> target by mapping
+    sparse `(row=target, col=source)` entries to `(source, target)`. In
+    undirected mode we keep the historical orientation; symmetric graphs are
+    unaffected either way.
+    """
+    idx = adj_sparse.coalesce().indices().long()
+    mask = idx[0] != idx[1]
+    idx = idx[:, mask]
+    if structure_mode == "directed":
+        return torch.stack([idx[1], idx[0]], dim=0).contiguous()
+    if structure_mode == "undirected":
+        return idx
+    raise ValueError(f"Unknown structure_mode={structure_mode!r}.")
+
+
+def normalize_adj_evolvegcn(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    device,
+    structure_mode: str,
+) -> torch.Tensor:
+    """Mirror EvolveGCN's `_normalize_adj` so a NETTACK-perturbed edge_index can
+    be fed back into the victim. Adds self-loops and applies symmetric
+    `D~^{-1/2} (A + I) D~^{-1/2}` normalization, returning a coalesced sparse
+    COO tensor of size (N, N). In directed mode, `edge_index` is source -> target
+    and the sparse matrix is written as row=target, col=source to match the
+    victim's row aggregation.
+    """
+    src, dst = edge_index[0].long(), edge_index[1].long()
+    mask = src != dst
+    src, dst = src[mask], dst[mask]
+    if structure_mode == "directed":
+        row, col = dst, src
+    elif structure_mode == "undirected":
+        row, col = src, dst
+    else:
+        raise ValueError(f"Unknown structure_mode={structure_mode!r}.")
+    sl = torch.arange(num_nodes, device=device, dtype=torch.long)
+    full_row = torch.cat([row, sl])
+    full_col = torch.cat([col, sl])
+    deg = torch.zeros(num_nodes, device=device, dtype=torch.float32)
+    deg.scatter_add_(0, full_row, torch.ones_like(full_row, dtype=torch.float32))
+    inv_sqrt = deg.clamp(min=1.0).pow(-0.5)
+    vals = inv_sqrt[full_row] * inv_sqrt[full_col]
+    indices = torch.stack([full_row, full_col], dim=0)
+    return torch.sparse_coo_tensor(indices, vals, (num_nodes, num_nodes)).coalesce()
+
+
+def _build_y_full(num_nodes: int, label_idx: torch.Tensor, label_vals: torch.Tensor, device) -> torch.Tensor:
+    """Construct an `(N,)` label tensor from `(label_idx, label_vals)`,
+    -1 elsewhere, used both by the surrogate trainer and the per-slice attack.
+    """
+    y = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+    y[label_idx.long()] = label_vals.long()
+    return y
+
+
+def _active_slice_marker(node_mask: torch.Tensor, device) -> torch.Tensor:
+    """Return a candidate-scope marker compatible with AdaptedNettackAttack.
+
+    EvolveGCN windows use the full global node set, with inactive rows masked by
+    `-inf`. Mark current active nodes as 0 and inactive nodes as 1 so the static
+    same-timestep candidate filter keeps additions inside the active slice.
+    """
+    values = node_mask.to(device).view(-1)
+    active = torch.isfinite(values) & (values >= 0)
+    marker = torch.ones(values.numel(), dtype=torch.long, device=device)
+    marker[active] = 0
+    return marker
 
 
 def main():
@@ -181,6 +257,9 @@ def main():
 
     results = PerTargetResults()
     per_window = []
+    clean_y_parts = []
+    clean_logits_parts = []
+    surrogate_clean_logits_parts = []
     attack_time_seconds = 0.0
 
     for sample in sequence.test_samples:
@@ -204,6 +283,13 @@ def main():
             )
         logits_surrogate_clean = logits_surrogate_clean_full[label_idx.long()]
         pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
+        labeled_pos = label_vals != -1
+        if int(labeled_pos.sum().item()) > 0:
+            clean_y_parts.append(label_vals[labeled_pos].detach().cpu())
+            clean_logits_parts.append(logits_clean[labeled_pos].detach().cpu())
+            surrogate_clean_logits_parts.append(
+                logits_surrogate_clean[labeled_pos].detach().cpu()
+            )
 
         pos = torch.arange(label_vals.numel(), device=device)
         pos = pos[label_vals != -1]
@@ -228,7 +314,6 @@ def main():
         active_marker = _active_slice_marker(node_mask_list[-1], device)
         n_edges_orig = int(edge_index_curr.size(1))
         window_start = len(results)
-        edge_unique_t = 0
         edge_directed_t = 0
         edge_targets_t = 0
 
@@ -280,10 +365,8 @@ def main():
             )
 
             n_edges_adv = int(edge_index_adv.size(1))
-            n_unique_added = int(info["n_unique_edges_added"])
             n_directed_added = int(info["n_directed_edges_added"])
             n_targets_with_edge = int(info["n_targets_with_edge_added"])
-            edge_unique_t += n_unique_added
             edge_directed_t += n_directed_added
             edge_targets_t += n_targets_with_edge
 
@@ -306,7 +389,6 @@ def main():
                 n_edges_orig=n_edges_orig,
                 n_edges_adv=n_edges_adv,
                 n_directed_added=n_directed_added,
-                n_unique_added=n_unique_added,
                 n_targets_with_edge=n_targets_with_edge,
                 adv_metrics={
                     "f1_pos": adv_m["f1_pos"],
@@ -324,7 +406,7 @@ def main():
                 print(
                     f"  [adapted-nettack-evolvegcn-pertarget] targets done={len(results)} "
                     f"t={t} target={target} success={last['victim']['success']} "
-                    f"edges+={n_unique_added}"
+                    f"edges+={n_directed_added}"
                 )
 
         entries = results.per_target[window_start:]
@@ -335,7 +417,6 @@ def main():
                 "t": t,
                 "n_labeled": int(label_idx.numel()),
                 "n_targets": int(target_global.numel()),
-                "n_unique_edges_added": edge_unique_t,
                 "n_directed_edges_added": edge_directed_t,
                 "n_targets_with_edge_added": edge_targets_t,
                 "asr": asr,
@@ -346,9 +427,10 @@ def main():
                 "surrogate_asr_attempted": surrogate_na,
             }
         )
+        asr_text = "nan" if asr is None else f"{asr:.4f}"
         print(
             f"t={t:2d}  n_labeled={label_idx.numel():5d}  "
-            f"n_targets={target_global.numel():4d}  independent ASR={asr:.4f} ({ns}/{na})"
+            f"n_targets={target_global.numel():4d}  independent ASR={asr_text} ({ns}/{na})"
         )
 
     if len(results) == 0:
@@ -356,6 +438,21 @@ def main():
         return
 
     summary = results.summarize()
+    clean_labeled = labeled_logits_summary(clean_logits_parts, clean_y_parts)
+    surrogate_clean_labeled = labeled_logits_summary(
+        surrogate_clean_logits_parts,
+        clean_y_parts,
+    )
+    classification = {
+        "scope": summary["classification"]["scope"],
+        "victim": {
+            "labeled_clean": clean_labeled,
+            **summary["classification"]["victim"],
+        },
+        "surrogate": {
+            "labeled_clean": surrogate_clean_labeled,
+        },
+    }
     run_dir, ts = make_pertarget_run_dir(MODEL_NAME)
     config = {
         "timestamp": ts,
@@ -370,6 +467,14 @@ def main():
             "description": (
                 "Each selected target is attacked from the clean current-window graph "
                 "independently; there is no cumulative adversarial graph per window."
+            ),
+        },
+        "outputs": {
+            "metrics": "metrics.json",
+            "config": "config.json",
+            "save_per_target_details": SAVE_PER_TARGET_DETAILS,
+            "per_target_details": (
+                "per_target_details.json" if SAVE_PER_TARGET_DETAILS else None
             ),
         },
         "attack_params": {
@@ -411,24 +516,27 @@ def main():
         "attack": "AdaptedNETTACKPerTarget",
         "model_name": MODEL_NAME,
         "dataset": DATASET,
-        "classification": summary["classification"],
-        "attack_effect": {
-            "attack_time_seconds": attack_time_seconds,
-            **summary["attack_effect"],
+        "classification": classification,
+        "target_outcome": summary["target_outcome"],
+        "perturbation": summary["perturbation"],
+        "diagnostics": {
+            **summary["diagnostics"],
+            "per_window": per_window,
         },
-        "per_window": per_window,
-        "surrogate": summary["surrogate"],
-        "per_target": summary["per_target"],
+        "runtime": {"attack_time_seconds": attack_time_seconds},
     }
     write_json(os.path.join(run_dir, "metrics.json"), metrics)
+    if SAVE_PER_TARGET_DETAILS:
+        write_json(os.path.join(run_dir, "per_target_details.json"), results.per_target)
 
-    asr_obj = summary["attack_effect"]["asr"]
-    structural = summary["attack_effect"]["structural"]
+    asr_obj = summary["target_outcome"]["victim"]["asr"]
+    asr_text = "nan" if asr_obj["value"] is None else f"{asr_obj['value']:.4f}"
+    edge_mean = summary["perturbation"]["structure"]["directed_edges_added"]["mean_per_target"]
     print(
-        f"Per-target ASR={asr_obj['value']:.4f} "
-        f"({asr_obj['success']}/{asr_obj['attempted']})  "
+        f"Per-target ASR={asr_text} "
+        f"({asr_obj['success']}/{asr_obj['attempted_clean_correct']})  "
         f"targets={len(results)}  "
-        f"mean_edges/target={structural['mean_unique_edges_per_target']:.2f}"
+        f"mean_edges/target={edge_mean:.2f}"
     )
     print(
         f"Saved to {os.path.relpath(run_dir, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))}"

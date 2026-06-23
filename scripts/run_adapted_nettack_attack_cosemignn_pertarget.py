@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from scripts.adapted_nettack_pertarget_utils import (
     PerTargetResults,
+    labeled_logits_summary,
     make_pertarget_run_dir,
     write_json,
 )
@@ -63,19 +64,20 @@ SURROGATE_WEIGHT_DECAY = 5e-4
 
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
-ATTACK_FRACTION = 1.0
+ATTACK_FRACTION = 0.2
 ONLY_CLEAN_CORRECT = False
 SEED = 0
 
 VERBOSE = True
 PROGRESS_EVERY = 100
+SAVE_PER_TARGET_DETAILS = False
 
 
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    #if torch.backends.mps.is_available():
+    #    return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -88,7 +90,7 @@ def cosemi_forward_logits(model, features, edge_index, ca_weights):
 def _entries_asr(entries, branch: str):
     attempted = sum(1 for item in entries if item[branch]["clean_correct"])
     success = sum(1 for item in entries if item[branch]["success"])
-    return (float(success) / float(attempted) if attempted else 0.0, success, attempted)
+    return (float(success) / float(attempted) if attempted else None, success, attempted)
 
 
 def main():
@@ -208,6 +210,9 @@ def main():
 
     results = PerTargetResults()
     per_slice = []
+    clean_y_parts = []
+    clean_logits_parts = []
+    surrogate_clean_logits_parts = []
     attack_time_seconds = 0.0
 
     for t in range(predict_start, predict_end):
@@ -232,6 +237,13 @@ def main():
                 structure_mode=STRUCTURE_MODE,
             )
         pred_surrogate_clean = logits_surrogate_clean.argmax(dim=1)
+        labeled_mask = labels != -1
+        if int(labeled_mask.sum().item()) > 0:
+            clean_y_parts.append(labels[labeled_mask].detach().cpu())
+            clean_logits_parts.append(logits_clean[labeled_mask].detach().cpu())
+            surrogate_clean_logits_parts.append(
+                logits_surrogate_clean[labeled_mask].detach().cpu()
+            )
 
         idx = torch.arange(labels.numel(), device=device)
         idx = idx[labels[idx] != -1]
@@ -255,7 +267,6 @@ def main():
 
         n_edges_orig = int(adj.size(1))
         slice_start = len(results)
-        edge_unique_t = 0
         edge_directed_t = 0
         edge_targets_t = 0
 
@@ -295,10 +306,8 @@ def main():
             )
 
             n_edges_adv = int(edge_index_adv.size(1))
-            n_unique_added = int(info["n_unique_edges_added"])
             n_directed_added = int(info["n_directed_edges_added"])
             n_targets_with_edge = int(info["n_targets_with_edge_added"])
-            edge_unique_t += n_unique_added
             edge_directed_t += n_directed_added
             edge_targets_t += n_targets_with_edge
 
@@ -315,7 +324,6 @@ def main():
                 n_edges_orig=n_edges_orig,
                 n_edges_adv=n_edges_adv,
                 n_directed_added=n_directed_added,
-                n_unique_added=n_unique_added,
                 n_targets_with_edge=n_targets_with_edge,
                 adv_metrics={
                     "f1_pos": adv_m["f1_pos"],
@@ -333,7 +341,7 @@ def main():
                 print(
                     f"  [adapted-nettack-cosemignn-pertarget] targets done={len(results)} "
                     f"t={t} target={target} success={last['victim']['success']} "
-                    f"edges+={n_unique_added}"
+                    f"edges+={n_directed_added}"
                 )
 
         entries = results.per_target[slice_start:]
@@ -344,7 +352,6 @@ def main():
                 "t": t,
                 "n_labeled": int(labels.numel()),
                 "n_targets": int(idx.numel()),
-                "n_unique_edges_added": edge_unique_t,
                 "n_directed_edges_added": edge_directed_t,
                 "n_targets_with_edge_added": edge_targets_t,
                 "asr": asr,
@@ -355,9 +362,10 @@ def main():
                 "surrogate_asr_attempted": surrogate_na,
             }
         )
+        asr_text = "nan" if asr is None else f"{asr:.4f}"
         print(
             f"t={t:2d}  n_labeled={labels.numel():5d}  "
-            f"n_targets={idx.numel():4d}  independent ASR={asr:.4f} ({ns}/{na})"
+            f"n_targets={idx.numel():4d}  independent ASR={asr_text} ({ns}/{na})"
         )
 
     if len(results) == 0:
@@ -365,6 +373,21 @@ def main():
         return
 
     summary = results.summarize()
+    clean_labeled = labeled_logits_summary(clean_logits_parts, clean_y_parts)
+    surrogate_clean_labeled = labeled_logits_summary(
+        surrogate_clean_logits_parts,
+        clean_y_parts,
+    )
+    classification = {
+        "scope": summary["classification"]["scope"],
+        "victim": {
+            "labeled_clean": clean_labeled,
+            **summary["classification"]["victim"],
+        },
+        "surrogate": {
+            "labeled_clean": surrogate_clean_labeled,
+        },
+    }
     run_dir, ts = make_pertarget_run_dir(MODEL_NAME)
     config = {
         "timestamp": ts,
@@ -379,6 +402,14 @@ def main():
             "description": (
                 "Each selected target is attacked from the clean timestep graph "
                 "independently; there is no cumulative adversarial graph per slice."
+            ),
+        },
+        "outputs": {
+            "metrics": "metrics.json",
+            "config": "config.json",
+            "save_per_target_details": SAVE_PER_TARGET_DETAILS,
+            "per_target_details": (
+                "per_target_details.json" if SAVE_PER_TARGET_DETAILS else None
             ),
         },
         "attack_params": {
@@ -426,24 +457,27 @@ def main():
         "attack": "AdaptedNETTACKPerTarget",
         "model_name": MODEL_NAME,
         "dataset": DATASET,
-        "classification": summary["classification"],
-        "attack_effect": {
-            "attack_time_seconds": attack_time_seconds,
-            **summary["attack_effect"],
+        "classification": classification,
+        "target_outcome": summary["target_outcome"],
+        "perturbation": summary["perturbation"],
+        "diagnostics": {
+            **summary["diagnostics"],
+            "per_timestep": per_slice,
         },
-        "per_timestep": per_slice,
-        "surrogate": summary["surrogate"],
-        "per_target": summary["per_target"],
+        "runtime": {"attack_time_seconds": attack_time_seconds},
     }
     write_json(os.path.join(run_dir, "metrics.json"), metrics)
+    if SAVE_PER_TARGET_DETAILS:
+        write_json(os.path.join(run_dir, "per_target_details.json"), results.per_target)
 
-    asr_obj = summary["attack_effect"]["asr"]
-    structural = summary["attack_effect"]["structural"]
+    asr_obj = summary["target_outcome"]["victim"]["asr"]
+    asr_text = "nan" if asr_obj["value"] is None else f"{asr_obj['value']:.4f}"
+    edge_mean = summary["perturbation"]["structure"]["directed_edges_added"]["mean_per_target"]
     print(
-        f"Per-target ASR={asr_obj['value']:.4f} "
-        f"({asr_obj['success']}/{asr_obj['attempted']})  "
+        f"Per-target ASR={asr_text} "
+        f"({asr_obj['success']}/{asr_obj['attempted_clean_correct']})  "
         f"targets={len(results)}  "
-        f"mean_edges/target={structural['mean_unique_edges_per_target']:.2f}"
+        f"mean_edges/target={edge_mean:.2f}"
     )
     print(
         f"Saved to {os.path.relpath(run_dir, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))}"

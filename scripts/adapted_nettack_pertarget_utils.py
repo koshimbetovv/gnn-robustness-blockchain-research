@@ -7,10 +7,8 @@ import torch
 
 from src.training.metrics import (
     attack_success_rate,
-    asr_pos_neg,
     binary_classification_metrics,
     mean_confidence_drop,
-    mean_perturbation_l2_on_success,
     roc_auc_binary,
 )
 
@@ -44,6 +42,285 @@ def target_prob(logits: torch.Tensor, label: int) -> float:
     return float(probs[int(label)].item())
 
 
+def _finite(values):
+    return [float(v) for v in values if float(v) == float(v)]
+
+
+def scalar_stats(values) -> dict:
+    vals = _finite(values)
+    if not vals:
+        return {"n": 0, "mean": float("nan"), "min": float("nan"), "max": float("nan")}
+    vals_sorted = sorted(vals)
+    mid = len(vals_sorted) // 2
+    if len(vals_sorted) % 2:
+        median = vals_sorted[mid]
+    else:
+        median = 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+    return {
+        "n": len(vals),
+        "mean": float(sum(vals) / len(vals)),
+        "median": float(median),
+        "min": float(vals_sorted[0]),
+        "max": float(vals_sorted[-1]),
+    }
+
+
+def int_histogram(values) -> list[dict]:
+    counts = {}
+    for value in values:
+        key = int(value)
+        counts[key] = counts.get(key, 0) + 1
+    return [{"value": key, "count": counts[key]} for key in sorted(counts)]
+
+
+def labeled_logits_summary(logits_parts: list[torch.Tensor], y_parts: list[torch.Tensor]) -> dict:
+    """Aggregate labeled classification metrics from clean logits."""
+    if not logits_parts or not y_parts:
+        return {"n_labeled": 0, "roc_auc": float("nan")}
+    logits = torch.cat([part.detach().cpu() for part in logits_parts], dim=0)
+    y = torch.cat([part.detach().cpu() for part in y_parts], dim=0).long()
+    mask = torch.ones(y.numel(), dtype=torch.bool)
+    pred = logits.argmax(dim=1)
+    return {
+        **binary_classification_metrics(y, pred),
+        "roc_auc": roc_auc_binary(logits, y, mask),
+    }
+
+
+def summarize_per_target_entries(entries: list[dict]) -> dict:
+    """Compact summary of detailed per-target records.
+
+    This intentionally avoids returning one row per target, keeping metrics.json
+    small enough to scan and diff. The full records can still be written to a
+    separate file by runner opt-in flags.
+    """
+    if not entries:
+        return {
+            "n_targets": 0,
+            "victim": {},
+            "surrogate": {},
+            "perturbation": {},
+            "success_by_directed_edges": [],
+        }
+
+    def branch_summary(branch: str) -> dict:
+        clean_correct = sum(1 for item in entries if item[branch]["clean_correct"])
+        success = sum(1 for item in entries if item[branch]["success"])
+        return {
+            "clean_correct": int(clean_correct),
+            "success": int(success),
+            "attempted": int(clean_correct),
+            "asr": float(success / clean_correct) if clean_correct else 0.0,
+            "confidence_drop": scalar_stats(
+                item[branch]["confidence_drop"] for item in entries
+            ),
+            "true_prob_adv": scalar_stats(
+                item[branch]["true_prob_adv"] for item in entries
+            ),
+        }
+
+    directed_values = [
+        item["perturbation"]["n_directed_edges_added"]
+        for item in entries
+    ]
+    feature_l2 = [item["perturbation"]["feature_l2"] for item in entries]
+
+    by_edges = {}
+    for item in entries:
+        key = int(item["perturbation"]["n_directed_edges_added"])
+        row = by_edges.setdefault(
+            key,
+            {
+                "n_targets": 0,
+                "victim_success": 0,
+                "victim_attempted": 0,
+                "surrogate_success": 0,
+                "surrogate_attempted": 0,
+            },
+        )
+        row["n_targets"] += 1
+        row["victim_success"] += int(item["victim"]["success"])
+        row["victim_attempted"] += int(item["victim"]["clean_correct"])
+        row["surrogate_success"] += int(item["surrogate"]["success"])
+        row["surrogate_attempted"] += int(item["surrogate"]["clean_correct"])
+
+    success_by_edges = []
+    for key in sorted(by_edges):
+        row = by_edges[key]
+        row = {"n_directed_edges_added": key, **row}
+        row["victim_asr"] = (
+            float(row["victim_success"] / row["victim_attempted"])
+            if row["victim_attempted"]
+            else 0.0
+        )
+        row["surrogate_asr"] = (
+            float(row["surrogate_success"] / row["surrogate_attempted"])
+            if row["surrogate_attempted"]
+            else 0.0
+        )
+        success_by_edges.append(row)
+
+    label_counts = {}
+    for item in entries:
+        label = int(item["y"])
+        label_counts[str(label)] = label_counts.get(str(label), 0) + 1
+
+    return {
+        "n_targets": int(len(entries)),
+        "label_counts": label_counts,
+        "victim": branch_summary("victim"),
+        "surrogate": branch_summary("surrogate"),
+        "perturbation": {
+            "feature_l2": scalar_stats(feature_l2),
+            "n_directed_edges_added": {
+                "stats": scalar_stats(directed_values),
+                "histogram": int_histogram(directed_values),
+            },
+            "n_targets_with_edge_added": int(
+                sum(
+                    1
+                    for item in entries
+                    if item["perturbation"]["n_targets_with_edge_added"] > 0
+                )
+            ),
+        },
+        "success_by_directed_edges": success_by_edges,
+    }
+
+
+def _classification_margin(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    y = y.long().view(-1)
+    logits = logits.float()
+    row = torch.arange(y.numel(), device=logits.device)
+    true_logits = logits[row, y]
+    other_logits = logits.clone()
+    other_logits[row, y] = float("-inf")
+    max_other = other_logits.max(dim=1).values
+    return true_logits - max_other
+
+
+def margin_summary(logits_clean: torch.Tensor, logits_adv: torch.Tensor, y: torch.Tensor) -> dict:
+    clean_margin = _classification_margin(logits_clean, y)
+    adv_margin = _classification_margin(logits_adv, y)
+    return {
+        "clean": scalar_stats(clean_margin.detach().cpu().tolist()),
+        "adv": scalar_stats(adv_margin.detach().cpu().tolist()),
+        "drop": scalar_stats((clean_margin - adv_margin).detach().cpu().tolist()),
+    }
+
+
+def _asr_object(value: float, success: int, attempted: int) -> dict:
+    return {
+        "value": float(value) if attempted else None,
+        "success": int(success),
+        "attempted_clean_correct": int(attempted),
+    }
+
+
+def target_outcome_branch(
+    *,
+    y: torch.Tensor,
+    pred_clean: torch.Tensor,
+    pred_adv: torch.Tensor,
+    logits_clean: torch.Tensor,
+    logits_adv: torch.Tensor,
+    summary: dict,
+    confidence_drop_value: float,
+    confidence_drop_n: int,
+) -> dict:
+    asr, success, attempted = attack_success_rate(
+        y,
+        pred_clean,
+        pred_adv,
+        torch.ones(y.numel(), dtype=torch.bool, device=y.device),
+    )
+    return {
+        "asr": _asr_object(asr, success, attempted),
+        "mean_confidence_drop_independent_attacks": {
+            "value": confidence_drop_value,
+            "n_clean_correct": int(confidence_drop_n),
+        },
+        "confidence_drop_all_targets": summary["confidence_drop"],
+        "true_prob_adv": summary["true_prob_adv"],
+        "classification_margin": margin_summary(logits_clean, logits_adv, y),
+    }
+
+
+def transfer_summary(
+    *,
+    y: torch.Tensor,
+    victim_pred_clean: torch.Tensor,
+    victim_pred_adv: torch.Tensor,
+    surrogate_pred_clean: torch.Tensor,
+    surrogate_pred_adv: torch.Tensor,
+    victim_asr: dict,
+    surrogate_asr: dict,
+) -> dict:
+    victim_success = (victim_pred_clean == y) & (victim_pred_adv != y)
+    surrogate_success = (surrogate_pred_clean == y) & (surrogate_pred_adv != y)
+    joint_success = victim_success & surrogate_success
+    surrogate_success_count = int(surrogate_success.sum().item())
+    joint_success_count = int(joint_success.sum().item())
+    return {
+        "asr_gap_surrogate_minus_victim": (
+            None
+            if victim_asr["value"] is None or surrogate_asr["value"] is None
+            else float(surrogate_asr["value"] - victim_asr["value"])
+        ),
+        "victim_success_given_surrogate_success": {
+            "value": (
+                float(joint_success_count / surrogate_success_count)
+                if surrogate_success_count
+                else None
+            ),
+            "victim_and_surrogate_success": joint_success_count,
+            "surrogate_success": surrogate_success_count,
+        },
+    }
+
+
+def perturbation_summary(
+    *,
+    per_target_summary: dict,
+    structure: dict,
+) -> dict:
+    edge_stats = per_target_summary["perturbation"]["n_directed_edges_added"]
+    structure_base = {
+        key: value
+        for key, value in structure.items()
+        if key
+        not in {
+            "n_directed_edges_added_total",
+            "mean_directed_edges_per_target",
+        }
+    }
+    return {
+        "feature": {
+            "l2_all_targets": per_target_summary["perturbation"]["feature_l2"],
+        },
+        "structure": {
+            **structure_base,
+            "directed_edges_added": {
+                "total": structure["n_directed_edges_added_total"],
+                "mean_per_target": structure["mean_directed_edges_per_target"],
+                "stats_per_target": edge_stats["stats"],
+                "histogram": edge_stats["histogram"],
+            },
+        },
+    }
+
+
+def diagnostics_summary(per_target_summary: dict, **extra) -> dict:
+    diagnostics = {
+        "label_counts": per_target_summary["label_counts"],
+    }
+    by_edges = per_target_summary.get("success_by_directed_edges", [])
+    if len(by_edges) > 1:
+        diagnostics["by_directed_edges_added"] = by_edges
+    diagnostics.update({k: v for k, v in extra.items() if v is not None})
+    return diagnostics
+
+
 class PerTargetResults:
     """Bookkeeping for independent per-target NETTACK runs."""
 
@@ -58,15 +335,12 @@ class PerTargetResults:
         self.target_pred_surrogate_adv = []
         self.target_logits_surrogate_clean = []
         self.target_logits_surrogate_adv = []
-        self.clean_rows = []
-        self.adv_rows = []
         self.adv_f1_pos = []
         self.adv_recall_pos = []
         self.adv_f1_macro = []
         self.adv_roc_auc = []
         self.n_edges_orig = []
         self.n_directed_added_total = 0
-        self.n_unique_added_total = 0
         self.n_targets_with_edge_total = 0
 
     def __len__(self):
@@ -87,7 +361,6 @@ class PerTargetResults:
         n_edges_orig: int,
         n_edges_adv: int,
         n_directed_added: int,
-        n_unique_added: int,
         n_targets_with_edge: int,
         adv_metrics: Optional[dict] = None,
     ) -> dict:
@@ -121,11 +394,8 @@ class PerTargetResults:
         self.target_logits_surrogate_adv.append(
             logits_surrogate_adv_target.detach().cpu()
         )
-        self.clean_rows.append(clean_row.detach().cpu())
-        self.adv_rows.append(adv_row.detach().cpu())
         self.n_edges_orig.append(int(n_edges_orig))
         self.n_directed_added_total += int(n_directed_added)
-        self.n_unique_added_total += int(n_unique_added)
         self.n_targets_with_edge_total += int(n_targets_with_edge)
 
         if adv_metrics is not None:
@@ -161,7 +431,6 @@ class PerTargetResults:
                 "n_edges_orig": int(n_edges_orig),
                 "n_edges_adv": int(n_edges_adv),
                 "n_directed_edges_added": int(n_directed_added),
-                "n_unique_edges_added": int(n_unique_added),
                 "n_targets_with_edge_added": int(n_targets_with_edge),
             },
         }
@@ -174,9 +443,11 @@ class PerTargetResults:
         if not self.target_y:
             return {
                 "classification": None,
-                "attack_effect": None,
-                "surrogate": None,
-                "per_target": self.per_target,
+                "target_outcome": None,
+                "perturbation": None,
+                "diagnostics": diagnostics_summary(
+                    summarize_per_target_entries(self.per_target)
+                ),
             }
 
         y_t = torch.tensor(self.target_y, dtype=torch.long)
@@ -196,44 +467,13 @@ class PerTargetResults:
         logits_surrogate_adv_t = torch.stack(
             self.target_logits_surrogate_adv, dim=0
         )
-        clean_rows_t = torch.stack(self.clean_rows, dim=0)
-        adv_rows_t = torch.stack(self.adv_rows, dim=0)
         target_mask = torch.ones(y_t.numel(), dtype=torch.bool)
+        per_target_summary = summarize_per_target_entries(self.per_target)
 
-        target_clean_m = binary_classification_metrics(y_t, pred_clean_t)
-        target_adv_m = binary_classification_metrics(y_t, pred_adv_t)
-        target_roc_clean = roc_auc_binary(logits_clean_t, y_t, target_mask)
-        target_roc_adv = roc_auc_binary(logits_adv_t, y_t, target_mask)
-        asr, ns, na = attack_success_rate(
-            y_t, pred_clean_t, pred_adv_t, target_mask
-        )
-        asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(
-            y_t, logits_clean_t, logits_adv_t, target_mask
-        )
         conf_drop, n_used = mean_confidence_drop(
             y_t, logits_clean_t, logits_adv_t, target_mask, only_clean_correct=True
         )
-        pert_l2_mean, pert_l2_n = mean_perturbation_l2_on_success(
-            clean_rows_t, adv_rows_t, pred_clean_t, pred_adv_t, y_t
-        )
 
-        surrogate_target_clean_m = binary_classification_metrics(
-            y_t, pred_surrogate_clean_t
-        )
-        surrogate_target_adv_m = binary_classification_metrics(
-            y_t, pred_surrogate_adv_t
-        )
-        surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
-            y_t, pred_surrogate_clean_t, pred_surrogate_adv_t, target_mask
-        )
-        (
-            surrogate_asr_p,
-            surrogate_sp,
-            surrogate_ap,
-            surrogate_asr_n,
-            surrogate_sn,
-            surrogate_an,
-        ) = asr_pos_neg(y_t, logits_surrogate_clean_t, logits_surrogate_adv_t, target_mask)
         surrogate_conf_drop, surrogate_n_used = mean_confidence_drop(
             y_t,
             logits_surrogate_clean_t,
@@ -244,109 +484,68 @@ class PerTargetResults:
 
         classification = {
             "scope": "temporal_independent_per_target",
-            "labeled_adv_independent_mean": {
-                "n_runs": int(y_t.numel()),
-                "f1_pos": nanmean(self.adv_f1_pos),
-                "recall_pos": nanmean(self.adv_recall_pos),
-                "f1_macro": nanmean(self.adv_f1_macro),
-                "roc_auc": nanmean(self.adv_roc_auc),
-            },
-            "target_only": {
-                "n": int(y_t.numel()),
-                "f1_pos": {
-                    "clean": target_clean_m["f1_pos"],
-                    "adv": target_adv_m["f1_pos"],
-                    "drop": float(target_clean_m["f1_pos"] - target_adv_m["f1_pos"]),
+            "victim": {
+                "labeled_adv_independent_mean": {
+                    "n_runs": int(y_t.numel()),
+                    "f1_pos": nanmean(self.adv_f1_pos),
+                    "recall_pos": nanmean(self.adv_recall_pos),
+                    "f1_macro": nanmean(self.adv_f1_macro),
+                    "roc_auc": nanmean(self.adv_roc_auc),
                 },
-                "recall_pos": {
-                    "clean": target_clean_m["recall_pos"],
-                    "adv": target_adv_m["recall_pos"],
-                    "drop": float(
-                        target_clean_m["recall_pos"] - target_adv_m["recall_pos"]
-                    ),
-                },
-                "f1_macro": {
-                    "clean": target_clean_m["f1_macro"],
-                    "adv": target_adv_m["f1_macro"],
-                    "drop": float(
-                        target_clean_m["f1_macro"] - target_adv_m["f1_macro"]
-                    ),
-                },
-                "roc_auc": {"clean": target_roc_clean, "adv": target_roc_adv},
-                "clean_metrics": target_clean_m,
-                "adv_metrics": target_adv_m,
             },
         }
 
-        attack_effect = {
+        victim_outcome = target_outcome_branch(
+            y=y_t,
+            pred_clean=pred_clean_t,
+            pred_adv=pred_adv_t,
+            logits_clean=logits_clean_t,
+            logits_adv=logits_adv_t,
+            summary=per_target_summary["victim"],
+            confidence_drop_value=conf_drop,
+            confidence_drop_n=n_used,
+        )
+        surrogate_outcome = target_outcome_branch(
+            y=y_t,
+            pred_clean=pred_surrogate_clean_t,
+            pred_adv=pred_surrogate_adv_t,
+            logits_clean=logits_surrogate_clean_t,
+            logits_adv=logits_surrogate_adv_t,
+            summary=per_target_summary["surrogate"],
+            confidence_drop_value=surrogate_conf_drop,
+            confidence_drop_n=surrogate_n_used,
+        )
+        target_outcome = {
             "n_targets": int(y_t.numel()),
-            "asr": {"value": asr, "success": ns, "attempted": na},
-            "asr_pos_neg": {
-                "asr_pos": asr_p,
-                "succ_pos": sp,
-                "attempted_pos": ap,
-                "asr_neg": asr_n,
-                "succ_neg": sn,
-                "attempted_neg": an,
-            },
-            "mean_confidence_drop": {"value": conf_drop, "n": n_used},
-            "perturbation_l2_on_success": {
-                "value": pert_l2_mean,
-                "n_flipped": pert_l2_n,
-            },
-            "structural": {
+            "victim": victim_outcome,
+            "surrogate": surrogate_outcome,
+            "transfer": transfer_summary(
+                y=y_t,
+                victim_pred_clean=pred_clean_t,
+                victim_pred_adv=pred_adv_t,
+                surrogate_pred_clean=pred_surrogate_clean_t,
+                surrogate_pred_adv=pred_surrogate_adv_t,
+                victim_asr=victim_outcome["asr"],
+                surrogate_asr=surrogate_outcome["asr"],
+            ),
+        }
+
+        perturbation = perturbation_summary(
+            per_target_summary=per_target_summary,
+            structure={
                 "mode": "independent_per_target_sum",
                 "n_edges_orig_min": int(min(self.n_edges_orig)),
                 "n_edges_orig_max": int(max(self.n_edges_orig)),
                 "n_edges_orig_mean": float(sum(self.n_edges_orig) / len(self.n_edges_orig)),
                 "n_directed_edges_added_total": self.n_directed_added_total,
-                "n_unique_edges_added_total": self.n_unique_added_total,
                 "n_targets_with_edge_added_total": self.n_targets_with_edge_total,
-                "mean_unique_edges_per_target": float(self.n_unique_added_total)
+                "mean_directed_edges_per_target": float(self.n_directed_added_total)
                 / float(y_t.numel()),
             },
-        }
-
-        surrogate = {
-            "classification": {
-                "scope": "temporal_independent_per_target",
-                "target_only": {
-                    "n": int(y_t.numel()),
-                    "f1_pos": {
-                        "clean": surrogate_target_clean_m["f1_pos"],
-                        "adv": surrogate_target_adv_m["f1_pos"],
-                        "drop": float(
-                            surrogate_target_clean_m["f1_pos"]
-                            - surrogate_target_adv_m["f1_pos"]
-                        ),
-                    },
-                    "clean_metrics": surrogate_target_clean_m,
-                    "adv_metrics": surrogate_target_adv_m,
-                },
-            },
-            "attack_effect": {
-                "asr": {
-                    "value": surrogate_asr,
-                    "success": surrogate_ns,
-                    "attempted": surrogate_na,
-                },
-                "asr_pos_neg": {
-                    "asr_pos": surrogate_asr_p,
-                    "succ_pos": surrogate_sp,
-                    "attempted_pos": surrogate_ap,
-                    "asr_neg": surrogate_asr_n,
-                    "succ_neg": surrogate_sn,
-                    "attempted_neg": surrogate_an,
-                },
-                "mean_confidence_drop": {
-                    "value": surrogate_conf_drop,
-                    "n": surrogate_n_used,
-                },
-            },
-        }
+        )
         return {
             "classification": classification,
-            "attack_effect": attack_effect,
-            "surrogate": surrogate,
-            "per_target": self.per_target,
+            "target_outcome": target_outcome,
+            "perturbation": perturbation,
+            "diagnostics": diagnostics_summary(per_target_summary),
         }
