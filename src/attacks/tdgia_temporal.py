@@ -216,7 +216,12 @@ class CoSemiGNNTDGIAAttack:
         feat_max: torch.Tensor,
     ) -> torch.Tensor:
         semi_dim = int(features.size(1)) - self.raw_dim
-        ref_raw = features[:, : self.raw_dim] if reference_nodes is None or reference_nodes.numel() == 0 else features[reference_nodes, : self.raw_dim]
+        ref = (
+            features
+            if reference_nodes is None or reference_nodes.numel() == 0
+            else features[reference_nodes.long()]
+        )
+        ref_raw = ref[:, : self.raw_dim]
         if init == "zeros":
             raw = torch.zeros((n_inject, self.raw_dim), device=self.device, dtype=features.dtype)
         elif init == "mean":
@@ -228,7 +233,16 @@ class CoSemiGNNTDGIAAttack:
         else:
             raise ValueError(f"Unknown init={init!r}")
         raw = raw.clamp(min=feat_min, max=feat_max)
-        semi = torch.zeros((n_inject, semi_dim), device=self.device, dtype=features.dtype)
+        if semi_dim > 0:
+            ref_semi = ref[:, self.raw_dim :]
+            sample_idx = torch.randint(
+                int(ref_semi.size(0)),
+                (int(n_inject),),
+                device=features.device,
+            )
+            semi = ref_semi[sample_idx].detach().to(features.dtype)
+        else:
+            semi = features.new_empty((int(n_inject), 0))
         return torch.cat([raw.to(features.dtype), semi], dim=1)
 
     @staticmethod

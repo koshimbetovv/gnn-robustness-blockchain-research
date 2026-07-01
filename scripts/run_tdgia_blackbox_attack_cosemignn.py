@@ -311,7 +311,32 @@ def apply_static_surrogate_raw_transform(raw_features: torch.Tensor, transform):
     return (raw_features - mean.to(raw_features.device)) / scale.to(raw_features.device)
 
 
-def transfer_static_surrogate_result_to_cosemi(res, features, raw_feature_dim, raw_transform):
+def sample_reference_semi_features(features, raw_feature_dim, reference_nodes, n_inj):
+    semi_existing = features[:, raw_feature_dim:]
+    semi_dim = int(semi_existing.size(1))
+    if int(n_inj) <= 0 or semi_dim <= 0:
+        return features.new_empty((int(n_inj), max(semi_dim, 0)))
+
+    if reference_nodes is None or reference_nodes.numel() == 0:
+        ref_semi = semi_existing
+    else:
+        ref_semi = semi_existing[reference_nodes.to(features.device).long()]
+
+    sample_idx = torch.randint(
+        int(ref_semi.size(0)),
+        (int(n_inj),),
+        device=features.device,
+    )
+    return ref_semi[sample_idx].detach().to(features.dtype)
+
+
+def transfer_static_surrogate_result_to_cosemi(
+    res,
+    features,
+    raw_feature_dim,
+    raw_transform,
+    reference_nodes,
+):
     semi_existing = features[:, raw_feature_dim:]
     semi_dim = int(semi_existing.size(1))
     n_inj = len(res.injected_node_ids)
@@ -325,7 +350,12 @@ def transfer_static_surrogate_result_to_cosemi(res, features, raw_feature_dim, r
         raw_existing = res.x_adv[: features.size(0)] * scale + mean
         raw_inj = res.x_adv[features.size(0) :] * scale + mean
     if n_inj > 0:
-        semi_inj = torch.zeros((n_inj, semi_dim), device=features.device, dtype=features.dtype)
+        semi_inj = sample_reference_semi_features(
+            features,
+            raw_feature_dim,
+            reference_nodes,
+            n_inj,
+        )
         x_adv = torch.cat(
             [
                 torch.cat([raw_existing, semi_existing], dim=1),
@@ -631,7 +661,11 @@ def main():
                 eps_feature=EPS_FEATURE,
             )
             x_adv_transfer = transfer_static_surrogate_result_to_cosemi(
-                res, features, raw_feature_dim, static_surrogate_raw_transform
+                res,
+                features,
+                raw_feature_dim,
+                static_surrogate_raw_transform,
+                init_reference,
             )
             edge_index_adv_transfer = res.edge_index_adv
         else:
