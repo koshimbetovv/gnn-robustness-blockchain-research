@@ -3,6 +3,7 @@ import sys
 import time
 import torch
 import json
+import math
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -36,7 +37,9 @@ RUN_ID = None
 
 SURROGATE_MODEL_NAME = "gcn"      # surrogate used for attack construction
 SURROGATE_MODEL_DIR = "models/Elliptic"
-SURROGATE_RUN_ID = None
+# Pin a normal repo GCN checkpoint. Leaving this as None may pick
+# gcn_tdgia_paper_surrogate, whose architecture is handled by attack2.py.
+SURROGATE_RUN_ID = "seed46_20260330_142208"
 
 # Must match the dataset the checkpoints were trained on. Options:
 #   "elliptic"           -> Elliptic (165 tx features)
@@ -46,8 +49,8 @@ SPLIT = "test"
 
 # ---------- TDGIA hyperparameters ----------
 EPS_FEATURE = 0.05     # None -> no local feature budget; else constrain injected features to base +/- eps
-N_INJECT = 10
-DEGREE_LIMIT = 40
+N_INJECT = 1
+DEGREE_LIMIT = 545
 BATCH_SIZE = 1
 STEPS = 30
 LR = 0.05
@@ -66,6 +69,16 @@ ONLY_CLEAN_CORRECT = False
 TARGET_SELECTION_MODEL = "surrogate"  # "surrogate" matches black-box crafting; "victim" is eval-oracle mode
 SEED = 0
 
+# ---------- budget-aware target controls ----------
+# "per_injection_degree": cap targets to degree_limit * multiplier. This is the
+# most focused option: each injected node can directly connect to every selected
+# target when multiplier=1.
+# "total_edge_capacity": cap targets to n_inject * degree_limit * multiplier.
+# "none": keep the original target count.
+BUDGET_AWARE_TARGET_CAP_MODE = "per_injection_degree"
+BUDGET_AWARE_TARGET_CAP_MULTIPLIER = 1.0
+BUDGET_AWARE_CLEAN_CORRECT_FIRST = True
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -78,7 +91,7 @@ def get_device():
 def make_run_dir(model_name: str, surrogate_name: str):
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_tdgia_blackbox_{surrogate_name}_{ts}")
+    run_dir = os.path.join(repo_root, "attacks", f"{model_name}_tdgia_blackbox_budget_aware_{surrogate_name}_{ts}")
     os.makedirs(run_dir, exist_ok=False)
     return run_dir, ts
 
@@ -97,6 +110,120 @@ def _validate_static_model(name: str, role: str) -> str:
             f"Supported here: {STATIC_MODELS}."
         )
     return name
+
+
+def _budget_target_cap(n_candidates: int) -> int:
+    n_candidates = int(n_candidates)
+    if n_candidates <= 0:
+        return 0
+
+    mode = str(BUDGET_AWARE_TARGET_CAP_MODE).lower()
+    if mode == "none":
+        return n_candidates
+    if mode == "per_injection_degree":
+        base = int(DEGREE_LIMIT)
+    elif mode == "total_edge_capacity":
+        base = int(N_INJECT) * int(DEGREE_LIMIT)
+    else:
+        raise ValueError(
+            "BUDGET_AWARE_TARGET_CAP_MODE must be one of "
+            "'per_injection_degree', 'total_edge_capacity', or 'none'."
+        )
+
+    cap = int(math.ceil(float(BUDGET_AWARE_TARGET_CAP_MULTIPLIER) * float(max(base, 1))))
+    return max(1, min(n_candidates, cap))
+
+
+def _rank_targets_for_tdgia(
+    atk: TDGIAAttack,
+    target_nodes: torch.Tensor,
+    attack_labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if target_nodes.numel() == 0:
+        return target_nodes, attack_labels, target_nodes.new_empty((0,), dtype=torch.float32)
+
+    mu, _ = atk._defective_scores(
+        x_curr=atk.x,
+        edge_index_curr=atk.edge_index,
+        time_step_curr=atk.time_step,
+        target_nodes=target_nodes,
+        surrogate_labels=attack_labels,
+        degree_limit=DEGREE_LIMIT,
+        alpha_mu=ALPHA_MU,
+        k1=K1,
+        k2=K2,
+    )
+    order = torch.argsort(mu, descending=True)
+    return target_nodes[order], attack_labels[order], mu[order]
+
+
+def select_budget_aware_targets(
+    *,
+    atk: TDGIAAttack,
+    data,
+    candidate_targets: torch.Tensor,
+    selection_logits: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    candidate_targets = candidate_targets.to(atk.device).long().view(-1)
+    cap = _budget_target_cap(int(candidate_targets.numel()))
+    candidate_labels = data.y[candidate_targets].long()
+
+    pred_clean = selection_logits.argmax(dim=1)
+    clean_correct_mask = pred_clean[candidate_targets] == candidate_labels
+    n_clean_correct_candidates = int(clean_correct_mask.sum().item())
+
+    if not BUDGET_AWARE_CLEAN_CORRECT_FIRST:
+        ranked_targets, ranked_labels, ranked_mu = _rank_targets_for_tdgia(atk, candidate_targets, candidate_labels)
+        selected_targets = ranked_targets[:cap]
+        selected_mu = ranked_mu[:cap]
+    else:
+        primary_targets = candidate_targets[clean_correct_mask]
+        primary_labels = candidate_labels[clean_correct_mask]
+        secondary_targets = candidate_targets[~clean_correct_mask]
+        secondary_labels = candidate_labels[~clean_correct_mask]
+
+        primary_targets, _, primary_mu = _rank_targets_for_tdgia(atk, primary_targets, primary_labels)
+        secondary_targets, _, secondary_mu = _rank_targets_for_tdgia(atk, secondary_targets, secondary_labels)
+
+        selected_parts = []
+        selected_mu_parts = []
+        if primary_targets.numel() > 0:
+            take_primary = min(cap, int(primary_targets.numel()))
+            selected_parts.append(primary_targets[:take_primary])
+            selected_mu_parts.append(primary_mu[:take_primary])
+        else:
+            take_primary = 0
+
+        remaining = cap - take_primary
+        if remaining > 0 and secondary_targets.numel() > 0:
+            take_secondary = min(remaining, int(secondary_targets.numel()))
+            selected_parts.append(secondary_targets[:take_secondary])
+            selected_mu_parts.append(secondary_mu[:take_secondary])
+
+        selected_targets = torch.cat(selected_parts) if selected_parts else candidate_targets[:0]
+        selected_mu = torch.cat(selected_mu_parts) if selected_mu_parts else candidate_targets.new_empty((0,), dtype=torch.float32)
+
+    if selected_targets.numel() > 0:
+        n_clean_correct_selected = int((pred_clean[selected_targets] == data.y[selected_targets]).sum().item())
+    else:
+        n_clean_correct_selected = 0
+
+    info = {
+        "enabled": True,
+        "cap_mode": BUDGET_AWARE_TARGET_CAP_MODE,
+        "cap_multiplier": BUDGET_AWARE_TARGET_CAP_MULTIPLIER,
+        "clean_correct_first": BUDGET_AWARE_CLEAN_CORRECT_FIRST,
+        "n_candidate_targets": int(candidate_targets.numel()),
+        "n_selected_targets": int(selected_targets.numel()),
+        "n_targets_dropped": int(candidate_targets.numel() - selected_targets.numel()),
+        "target_cap": int(cap),
+        "selection_clean_correct_candidates": n_clean_correct_candidates,
+        "selection_clean_correct_selected": n_clean_correct_selected,
+        "selected_defective_score_mean": float(selected_mu.mean().item()) if selected_mu.numel() > 0 else 0.0,
+        "selected_defective_score_min": float(selected_mu.min().item()) if selected_mu.numel() > 0 else 0.0,
+        "selected_defective_score_max": float(selected_mu.max().item()) if selected_mu.numel() > 0 else 0.0,
+    }
+    return selected_targets, info
 
 
 def main():
@@ -166,7 +293,7 @@ def main():
     # Target selection is an evaluation protocol choice. The attack construction
     # below only sees the selected node ids and the surrogate model. Keep the
     # default on surrogate logits to avoid target-model queries before transfer.
-    targets = pick_target_nodes(
+    candidate_targets = pick_target_nodes(
         data, selection_logits, split_mask,
         only_illicit=ATTACK_ONLY_ILLICIT,
         fraction=ATTACK_FRACTION,
@@ -174,15 +301,9 @@ def main():
         seed=SEED,
         device=device,
     )
-    if targets.numel() == 0:
+    if candidate_targets.numel() == 0:
         print("No eligible target nodes found for the chosen settings.")
         return
-
-    init_ref_mask = split_mask & (data.y == 0)
-    init_ref_mask[targets] = False
-    init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
-    if init_reference.numel() == 0:
-        init_reference = None
 
     atk = TDGIAAttack(
         surrogate_model,
@@ -192,6 +313,28 @@ def main():
         attack_dim=attack_dim,
         rebuild_fn=rebuild_fn,
     )
+
+    targets, budget_info = select_budget_aware_targets(
+        atk=atk,
+        data=data,
+        candidate_targets=candidate_targets,
+        selection_logits=selection_logits,
+    )
+    if targets.numel() == 0:
+        print("No budget-aware target nodes remain after capping.")
+        return
+
+    print(
+        "Budget-aware target cap: "
+        f"{budget_info['n_selected_targets']}/{budget_info['n_candidate_targets']} selected "
+        f"(mode={budget_info['cap_mode']}, cap={budget_info['target_cap']})"
+    )
+
+    init_ref_mask = split_mask & (data.y == 0)
+    init_ref_mask[targets] = False
+    init_reference = init_ref_mask.nonzero(as_tuple=False).view(-1)
+    if init_reference.numel() == 0:
+        init_reference = None
 
     t_start = time.perf_counter()
     res = atk.attack(
@@ -271,8 +414,8 @@ def main():
     n_injected_nodes = int(res.x_adv.size(0) - data.x.size(0))
     logical_edges_added = int(len(res.injected_edges))
     coverage = coverage_metrics(
-        n_selected_targets=int(targets.numel()),
-        n_budgeted_selected_targets=int(targets.numel()) if int(N_INJECT) > 0 else 0,
+        n_selected_targets=int(candidate_targets.numel()),
+        n_budgeted_selected_targets=int(targets.numel()),
         n_attacked_targets=int(target_outcome["n_attacked_targets"]),
         target_unit="node",
     )
@@ -286,7 +429,7 @@ def main():
     run_dir, ts = make_run_dir(victim_name, surrogate_name)
     config = {
         "timestamp": ts,
-        "attack": "TDGIA-BlackBox",
+        "attack": "TDGIA-BlackBox-BudgetAware",
         "threat_model": {
             "access": "black_box_transfer",
             "attack_stage": "evasion",
@@ -327,13 +470,15 @@ def main():
             "attack_fraction": ATTACK_FRACTION,
             "only_clean_correct": ONLY_CLEAN_CORRECT,
             "seed": SEED,
+            "n_candidate_targets": int(candidate_targets.numel()),
             "n_targets": int(targets.numel()),
+            "budget_aware": budget_info,
         },
     }
     write_json(os.path.join(run_dir, "config.json"), config)
 
     metrics = {
-        "attack": "TDGIA-BlackBox",
+        "attack": "TDGIA-BlackBox-BudgetAware",
         "model_name": victim_name,
         "surrogate_model_name": surrogate_name,
         "dataset": DATASET,
@@ -369,6 +514,7 @@ def main():
         },
         "attack_effect": {
             "attack_time_seconds": attack_time_seconds,
+            "budget_aware": budget_info,
             "target_outcome": target_outcome,
             "coverage": coverage,
             "budget_efficiency": budget_efficiency,

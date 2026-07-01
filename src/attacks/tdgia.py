@@ -251,6 +251,7 @@ class TDGIAAttack(BaseAttack):
         self,
         target_nodes: torch.Tensor,
         *,
+        attack_labels: Optional[torch.Tensor] = None,
         n_inject: int = 5,
         degree_limit: int = 20,
         batch_size: int = 1,
@@ -268,10 +269,36 @@ class TDGIAAttack(BaseAttack):
         if not torch.is_tensor(target_nodes):
             target_nodes = torch.tensor(target_nodes, dtype=torch.long)
         target_nodes = target_nodes.to(self.device).long().view(-1)
-        target_nodes = torch.unique(target_nodes)
+        if attack_labels is not None:
+            if not torch.is_tensor(attack_labels):
+                attack_labels = torch.tensor(attack_labels, dtype=torch.long)
+            attack_labels = attack_labels.to(self.device).long().view(-1)
+            if attack_labels.numel() != target_nodes.numel():
+                raise ValueError(
+                    "attack_labels must align one-to-one with target_nodes "
+                    f"({attack_labels.numel()} labels for {target_nodes.numel()} targets)."
+                )
+
+        keep_pos: list[int] = []
+        seen: set[int] = set()
+        for pos, node_id in enumerate(target_nodes.detach().cpu().tolist()):
+            if int(node_id) in seen:
+                continue
+            seen.add(int(node_id))
+            keep_pos.append(pos)
+        if keep_pos:
+            keep_idx = torch.tensor(keep_pos, dtype=torch.long, device=self.device)
+            target_nodes = target_nodes[keep_idx]
+            if attack_labels is not None:
+                attack_labels = attack_labels[keep_idx]
 
         labeled_mask = self.y[target_nodes] != -1
         target_nodes = target_nodes[labeled_mask]
+        if attack_labels is not None:
+            attack_labels = attack_labels[labeled_mask]
+            valid_attack_labels = attack_labels != -1
+            target_nodes = target_nodes[valid_attack_labels]
+            attack_labels = attack_labels[valid_attack_labels]
         if target_nodes.numel() == 0 or int(n_inject) <= 0:
             return TDGIAResult(
                 x_adv=self.x.clone(),
@@ -287,7 +314,21 @@ class TDGIAAttack(BaseAttack):
 
         with torch.no_grad():
             logits_clean = forward_logits(self.model, self.x, self.edge_index, time_step=self.time_step)
-            surrogate_labels = logits_clean[target_nodes].argmax(dim=1)
+            if attack_labels is None:
+                surrogate_labels = logits_clean[target_nodes].argmax(dim=1)
+            else:
+                surrogate_labels = attack_labels
+            if (
+                surrogate_labels.numel() > 0
+                and (
+                    int(surrogate_labels.min().item()) < 0
+                    or int(surrogate_labels.max().item()) >= int(logits_clean.size(1))
+                )
+            ):
+                raise ValueError(
+                    "attack_labels contain class ids outside the model output range "
+                    f"[0, {int(logits_clean.size(1)) - 1}]."
+                )
 
         x_curr = self.x.clone()
         edge_index_curr = self.edge_index.clone()

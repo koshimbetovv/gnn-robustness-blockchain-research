@@ -20,6 +20,53 @@ def _dedupe_targets(target_nodes: torch.Tensor) -> torch.Tensor:
     return target_nodes[torch.tensor(keep, dtype=torch.long, device=target_nodes.device)]
 
 
+def _dedupe_targets_and_labels(
+    target_nodes: torch.Tensor,
+    attack_labels: Optional[torch.Tensor],
+    device: torch.device,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not torch.is_tensor(target_nodes):
+        target_nodes = torch.tensor(target_nodes, dtype=torch.long)
+    target_nodes = target_nodes.to(device).long().view(-1)
+
+    if attack_labels is not None:
+        if not torch.is_tensor(attack_labels):
+            attack_labels = torch.tensor(attack_labels, dtype=torch.long)
+        attack_labels = attack_labels.to(device).long().view(-1)
+        if attack_labels.numel() != target_nodes.numel():
+            raise ValueError(
+                "attack_labels must align one-to-one with target_nodes "
+                f"({attack_labels.numel()} labels for {target_nodes.numel()} targets)."
+            )
+
+    if target_nodes.numel() == 0:
+        return target_nodes, attack_labels
+
+    keep: list[int] = []
+    seen: set[int] = set()
+    for pos, node_id in enumerate(target_nodes.detach().cpu().tolist()):
+        if int(node_id) in seen:
+            continue
+        seen.add(int(node_id))
+        keep.append(pos)
+
+    keep_idx = torch.tensor(keep, dtype=torch.long, device=device)
+    target_nodes = target_nodes[keep_idx]
+    if attack_labels is not None:
+        attack_labels = attack_labels[keep_idx]
+    return target_nodes, attack_labels
+
+
+def _validate_attack_labels(attack_labels: torch.Tensor, num_classes: int) -> None:
+    if attack_labels.numel() == 0:
+        return
+    if int(attack_labels.min().item()) < 0 or int(attack_labels.max().item()) >= int(num_classes):
+        raise ValueError(
+            "attack_labels contain class ids outside the model output range "
+            f"[0, {int(num_classes) - 1}]."
+        )
+
+
 def _smoothmap(latent: torch.Tensor, feat_min: torch.Tensor, feat_max: torch.Tensor) -> torch.Tensor:
     mid = 0.5 * (feat_max + feat_min)
     amp = 0.5 * (feat_max - feat_min)
@@ -259,8 +306,9 @@ class CoSemiGNNTDGIAAttack:
         sigma_scale: float = 1.0,
         eps_feature: Optional[float] = None,
         ca_weights: Optional[torch.Tensor] = None,
+        attack_labels: Optional[torch.Tensor] = None,
     ) -> CoSemiTDGIAResult:
-        target_nodes = _dedupe_targets(target_nodes.to(self.device))
+        target_nodes, attack_labels = _dedupe_targets_and_labels(target_nodes, attack_labels, self.device)
         n_existing = int(features.size(0))
         with torch.no_grad():
             logits_clean = self.forward_logits(features, adj, ca_weights).detach()
@@ -269,7 +317,8 @@ class CoSemiGNNTDGIAAttack:
             return CoSemiTDGIAResult(features.clone(), adj.clone(), logits_clean.clone(), logits_clean, features.new_empty((0, features.size(1))), [], [])
 
         feat_min, feat_max = _feature_range(features, 0, self.raw_dim, self.clamp)
-        surrogate_labels = logits_clean[target_nodes].argmax(dim=1)
+        surrogate_labels = logits_clean[target_nodes].argmax(dim=1) if attack_labels is None else attack_labels
+        _validate_attack_labels(surrogate_labels, int(logits_clean.size(1)))
         x_curr = features.clone()
         edge_curr = adj.clone()
         all_base: list[torch.Tensor] = []
@@ -498,8 +547,9 @@ class EvolveGCNTDGIAAttack:
         reference_nodes: Optional[torch.Tensor] = None,
         sigma_scale: float = 1.0,
         eps_feature: Optional[float] = None,
+        attack_labels: Optional[torch.Tensor] = None,
     ) -> EvolveGCNTDGIAResult:
-        target_nodes = _dedupe_targets(target_nodes.to(self.device))
+        target_nodes, attack_labels = _dedupe_targets_and_labels(target_nodes, attack_labels, self.device)
         base_last_clean = hist_ndFeats_list[-1]
         n_existing = int(base_last_clean.size(0))
 
@@ -517,7 +567,8 @@ class EvolveGCNTDGIAAttack:
 
         with torch.no_grad():
             clean_target_logits = self._forward(hist_adj_list, hist_ndFeats_list, node_mask_list, target_nodes).detach()
-        surrogate_labels = clean_target_logits.argmax(dim=1)
+        surrogate_labels = clean_target_logits.argmax(dim=1) if attack_labels is None else attack_labels
+        _validate_attack_labels(surrogate_labels, int(clean_target_logits.size(1)))
         feat_min, feat_max = _feature_range(base_last_clean, self.attack_start_col, attack_dim, self.clamp)
 
         hist_adj_curr = list(hist_adj_list)
@@ -755,8 +806,9 @@ class RecGNNTDGIAAttack:
         reference_nodes: Optional[torch.Tensor] = None,
         sigma_scale: float = 1.0,
         eps_feature: Optional[float] = None,
+        attack_labels: Optional[torch.Tensor] = None,
     ) -> RecGNNTDGIAResult:
-        target_nodes = _dedupe_targets(target_nodes.to(self.device))
+        target_nodes, attack_labels = _dedupe_targets_and_labels(target_nodes, attack_labels, self.device)
         n_existing = int(x.size(0))
         snap_pre = self._save_state()
 
@@ -776,7 +828,8 @@ class RecGNNTDGIAAttack:
                 f"state_rows = {state_rows}. Reduce n_inject or use a model with larger state_rows."
             )
 
-        surrogate_labels = log_probs_clean[target_nodes].argmax(dim=1)
+        surrogate_labels = log_probs_clean[target_nodes].argmax(dim=1) if attack_labels is None else attack_labels
+        _validate_attack_labels(surrogate_labels, int(log_probs_clean.size(1)))
         feat_min, feat_max = _feature_range(x, 0, self.attack_dim, self.clamp)
         x_curr = x.clone()
         edge_curr = edge_index.clone()

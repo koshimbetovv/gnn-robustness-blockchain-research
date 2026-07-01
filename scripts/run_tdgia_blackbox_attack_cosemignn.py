@@ -22,18 +22,33 @@ from src.attacks.model_forward import STATIC_MODELS, forward_logits
 from src.utils.model_loader import resolve_checkpoint
 from src.utils.model_loader import load_model
 from src.utils.seed import set_seed
+from src.utils.tdgia_schedule import (
+    degree_from_edge_index,
+    score_based_injection_schedule,
+    slot_scores_from_node_scores,
+    tdgia_defective_scores_from_probability,
+)
 from src.training.metrics import (
-    binary_classification_metrics, attack_success_rate, roc_auc_binary,
-    mean_confidence_drop, asr_pos_neg,
+    binary_classification_metrics, roc_auc_binary,
+    mean_confidence_drop,
 )
 from src.models.cosemignn import CoSemiGNN
+from src.utils.tdgia_metrics import (
+    aggregate_attacked_target_outcomes,
+    budget_efficiency_metrics,
+    attacked_target_ids_from_edges,
+    attacked_target_outcome,
+    coverage_metrics,
+    mask_from_target_ids,
+)
 
 # ---------- victim / surrogate parameters ----------
 MODEL_NAME = "cosemignn"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None
 
-SURROGATE_MODEL_NAME = "temporal_gcn"
+#SURROGATE_MODEL_NAME = "temporal_gcn"
+SURROGATE_MODEL_NAME = "cosemignn"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
 
@@ -52,13 +67,13 @@ TEMPORAL_GCN_LOG_EVERY = 50
 DATASET = "elliptic"
 
 # ---------- TDGIA hyperparameters ----------
-N_INJECT = 5
-DEGREE_LIMIT = 20
+N_INJECT = 10
+DEGREE_LIMIT = 5
 BATCH_SIZE = 1
 EPS_FEATURE = 0.05
 STEPS = 30
 LR = 0.05
-SMOOTH_R = 0.5
+SMOOTH_R = 0.7
 ALPHA_MU = 0.5
 K1 = 1.0
 K2 = 1.0
@@ -69,7 +84,7 @@ CLAMP = None
 # ---------- target selection controls ----------
 ATTACK_ONLY_ILLICIT = True
 ATTACK_FRACTION = 1.0
-ONLY_CLEAN_CORRECT = True
+ONLY_CLEAN_CORRECT = False
 TARGET_SELECTION_MODEL = "surrogate"  # "surrogate" matches black-box crafting; "victim" is eval-oracle mode
 SEED = 0
 
@@ -113,18 +128,13 @@ def pick_targets_slice(labels, pred_clean, only_illicit, only_clean_correct, fra
     return idx[perm[:n].to(idx.device)]
 
 
-def sample_injection_schedule(eligible_timesteps: list[int], n_inject: int, seed: int):
-    """Sample a sequence-wide node budget allocation over eligible timesteps."""
-    if n_inject <= 0 or not eligible_timesteps:
-        return [], {}
-    g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed))
-    draw = torch.randint(len(eligible_timesteps), (int(n_inject),), generator=g)
-    sampled_timesteps = [int(eligible_timesteps[i]) for i in draw.tolist()]
-    allocation = {int(t): 0 for t in eligible_timesteps}
-    for t in sampled_timesteps:
-        allocation[int(t)] += 1
-    return sampled_timesteps, allocation
+def sample_injection_schedule(
+    eligible_timesteps: list[int],
+    timestep_slot_scores: dict[int, list[float]],
+    n_inject: int,
+):
+    """Allocate the sequence-wide node budget to the highest TDGIA-scored slices."""
+    return score_based_injection_schedule(eligible_timesteps, timestep_slot_scores, n_inject)
 
 
 class PaperStyleSliceGCN(nn.Module):
@@ -450,9 +460,11 @@ def main():
 
     planning_targets: dict[int, torch.Tensor] = {}
     eligible_timesteps: list[int] = []
+    timestep_slot_scores: dict[int, list[float]] = {}
     for t in range(predict_start, predict_end):
         if t >= len(feature_list):
             planning_targets[t] = torch.empty(0, dtype=torch.long)
+            timestep_slot_scores[t] = []
             continue
         features = feature_list[t]
         adj = adj_list[t]
@@ -461,6 +473,7 @@ def main():
 
         if features is None or labels is None or features.numel() == 0 or labels.numel() == 0:
             planning_targets[t] = torch.empty(0, dtype=torch.long)
+            timestep_slot_scores[t] = []
             continue
 
         if TARGET_SELECTION_MODEL not in ("surrogate", "victim"):
@@ -485,14 +498,26 @@ def main():
         )
         planning_targets[t] = targets.detach().cpu()
         if targets.numel() > 0:
+            attack_labels = labels[targets].long()
+            probs = F.softmax(logits_clean[targets], dim=1)
+            pv = probs.gather(1, attack_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
+            degree = degree_from_edge_index(int(features.size(0)), adj)[targets]
+            mu = tdgia_defective_scores_from_probability(
+                pv, degree, DEGREE_LIMIT, ALPHA_MU, K1, K2
+            )
+            timestep_slot_scores[t] = slot_scores_from_node_scores(
+                mu, N_INJECT, DEGREE_LIMIT
+            )
             eligible_timesteps.append(t)
+        else:
+            timestep_slot_scores[t] = []
 
     sampled_injection_timesteps, injection_allocation = sample_injection_schedule(
-        eligible_timesteps, N_INJECT, SEED
+        eligible_timesteps, timestep_slot_scores, N_INJECT
     )
     print(
         f"Eligible attack slices: {len(eligible_timesteps)} | "
-        f"sampled injections: {len(sampled_injection_timesteps)}"
+        f"score-selected injections: {len(sampled_injection_timesteps)}"
     )
 
     per_slice = []
@@ -502,17 +527,13 @@ def main():
     pooled_logits_clean = []
     pooled_logits_adv = []
     pooled_attack_mask = []
-    pooled_surrogate_pred_clean = []
-    pooled_surrogate_pred_adv = []
-    pooled_surrogate_logits_clean = []
-    pooled_surrogate_logits_adv = []
-    pooled_surrogate_attack_mask = []
     pooled_injected_l2 = []
     pooled_injected_abs = []
     pooled_injected_signed = []
     total_injected_nodes = 0
     total_edges_added = 0
     attack_time_seconds = 0.0
+    attacked_target_outcomes = []
 
     for t in range(predict_start, predict_end):
         assigned_n_inject = int(injection_allocation.get(t, 0))
@@ -521,7 +542,8 @@ def main():
                 "t": t,
                 "n_labeled": 0,
                 "n_targets_available": 0,
-                "n_targets_attacked": 0,
+                "n_budgeted_selected_targets": 0,
+                "n_attacked_targets": 0,
                 "n_injected_nodes_budgeted": assigned_n_inject,
                 "n_injected_nodes": 0,
                 "skipped": True,
@@ -537,7 +559,8 @@ def main():
                 "t": t,
                 "n_labeled": 0,
                 "n_targets_available": 0,
-                "n_targets_attacked": 0,
+                "n_budgeted_selected_targets": 0,
+                "n_attacked_targets": 0,
                 "n_injected_nodes_budgeted": assigned_n_inject,
                 "n_injected_nodes": 0,
                 "skipped": True,
@@ -563,7 +586,8 @@ def main():
                 "t": t,
                 "n_labeled": int(labels.numel()),
                 "n_targets_available": int(targets.numel()),
-                "n_targets_attacked": 0,
+                "n_budgeted_selected_targets": 0,
+                "n_attacked_targets": 0,
                 "n_injected_nodes_budgeted": assigned_n_inject,
                 "n_injected_nodes": 0,
                 "skipped": True,
@@ -574,12 +598,6 @@ def main():
             pooled_logits_clean.append(logits_clean.detach().cpu())
             pooled_logits_adv.append(logits_clean.detach().cpu())
             pooled_attack_mask.append(torch.zeros(labels.numel(), dtype=torch.bool))
-            empty_mask_cpu = torch.zeros(labels.numel(), dtype=torch.bool)
-            pooled_surrogate_pred_clean.append(surrogate_pred_clean.detach().cpu())
-            pooled_surrogate_pred_adv.append(surrogate_pred_clean.detach().cpu())
-            pooled_surrogate_logits_clean.append(surrogate_logits_clean.detach().cpu())
-            pooled_surrogate_logits_adv.append(surrogate_logits_clean.detach().cpu())
-            pooled_surrogate_attack_mask.append(empty_mask_cpu)
             continue
 
         # Init reference: licit labeled nodes in this slice, excluding targets.
@@ -605,6 +623,7 @@ def main():
             )
             res = static_atk.attack(
                 target_nodes=targets,
+                attack_labels=labels[targets].long(),
                 n_inject=assigned_n_inject, degree_limit=DEGREE_LIMIT,
                 batch_size=BATCH_SIZE, steps=STEPS, lr=LR, smooth_r=SMOOTH_R,
                 alpha_mu=ALPHA_MU, k1=K1, k2=K2,
@@ -624,6 +643,7 @@ def main():
                 init=INIT, reference_nodes=init_reference, sigma_scale=SIGMA_SCALE,
                 eps_feature=EPS_FEATURE,
                 ca_weights=ca_weights,
+                attack_labels=labels[targets].long(),
             )
             x_adv_transfer = res.x_adv
             edge_index_adv_transfer = res.edge_index_adv
@@ -642,17 +662,20 @@ def main():
         pred_adv = logits_adv.argmax(dim=1)
         surrogate_pred_adv = surrogate_logits_adv.argmax(dim=1)
 
-        attack_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=device)
-        attack_mask[targets] = True
-
-        asr, ns, na = attack_success_rate(labels, pred_clean, pred_adv, attack_mask)
-        asr_p, sp, ap, asr_n, sn, an = asr_pos_neg(labels, logits_clean, logits_adv, attack_mask)
-        surrogate_asr, surrogate_ns, surrogate_na = attack_success_rate(
-            labels, surrogate_pred_clean, surrogate_pred_adv, attack_mask
+        attacked_target_ids = attacked_target_ids_from_edges(res.injected_edges, targets)
+        attacked_mask = mask_from_target_ids(
+            labels.numel(), attacked_target_ids, device
         )
-        surrogate_asr_p, surrogate_sp, surrogate_ap, surrogate_asr_n, surrogate_sn, surrogate_an = asr_pos_neg(
-            labels, surrogate_logits_clean, surrogate_logits_adv, attack_mask
+        target_outcome = attacked_target_outcome(
+            y_true=labels,
+            victim_pred_clean=pred_clean,
+            victim_pred_adv=pred_adv,
+            surrogate_pred_clean=surrogate_pred_clean,
+            surrogate_pred_adv=surrogate_pred_adv,
+            attacked_mask=attacked_mask,
+            target_unit="timestep_node",
         )
+        attacked_target_outcomes.append(target_outcome)
 
         slice_mask = torch.ones(labels.numel(), dtype=torch.bool, device=device)
         roc_clean = roc_auc_binary(logits_clean, labels, slice_mask)
@@ -661,7 +684,7 @@ def main():
         adv_m = binary_classification_metrics(labels, pred_adv)
 
         conf_drop, n_used = mean_confidence_drop(
-            labels, logits_clean, logits_adv, attack_mask, only_clean_correct=True
+            labels, logits_clean, logits_adv, attacked_mask, only_clean_correct=True
         )
 
         if len(res.injected_node_ids) > 0:
@@ -696,22 +719,13 @@ def main():
             "t": t,
             "n_labeled": int(labels.numel()),
             "n_targets_available": int(targets.numel()),
-            "n_targets_attacked": int(targets.numel()),
+            "n_budgeted_selected_targets": int(targets.numel()),
+            "n_attacked_targets": int(target_outcome["n_attacked_targets"]),
             "n_injected_nodes_budgeted": assigned_n_inject,
             "n_injected_nodes": len(res.injected_node_ids),
             "edges_added": len(res.injected_edges),
-            "asr": asr, "asr_success": ns, "asr_attempted": na,
-            "asr_pos": asr_p, "asr_pos_success": sp, "asr_pos_attempted": ap,
-            "asr_neg": asr_n, "asr_neg_success": sn, "asr_neg_attempted": an,
-            "surrogate_asr": surrogate_asr,
-            "surrogate_asr_success": surrogate_ns,
-            "surrogate_asr_attempted": surrogate_na,
-            "surrogate_asr_pos": surrogate_asr_p,
-            "surrogate_asr_pos_success": surrogate_sp,
-            "surrogate_asr_pos_attempted": surrogate_ap,
-            "surrogate_asr_neg": surrogate_asr_n,
-            "surrogate_asr_neg_success": surrogate_sn,
-            "surrogate_asr_neg_attempted": surrogate_an,
+            "attacked_target_ids": attacked_target_ids,
+            "target_outcome": target_outcome,
             "f1_pos_clean": clean_m["f1_pos"], "f1_pos_adv": adv_m["f1_pos"], "f1_pos_drop": f1_pos_drop,
             "f1_macro_clean": clean_m["f1_macro"], "f1_macro_adv": adv_m["f1_macro"],
             "recall_pos_clean": clean_m["recall_pos"], "recall_pos_adv": adv_m["recall_pos"], "recall_pos_drop": recall_pos_drop,
@@ -728,16 +742,15 @@ def main():
         pooled_pred_adv.append(pred_adv.detach().cpu())
         pooled_logits_clean.append(logits_clean.detach().cpu())
         pooled_logits_adv.append(logits_adv.detach().cpu())
-        pooled_attack_mask.append(attack_mask.detach().cpu())
-        pooled_surrogate_pred_clean.append(surrogate_pred_clean.detach().cpu())
-        pooled_surrogate_pred_adv.append(surrogate_pred_adv.detach().cpu())
-        pooled_surrogate_logits_clean.append(surrogate_logits_clean.detach().cpu())
-        pooled_surrogate_logits_adv.append(surrogate_logits_adv.detach().cpu())
-        pooled_surrogate_attack_mask.append(attack_mask.detach().cpu())
+        pooled_attack_mask.append(attacked_mask.detach().cpu())
 
+        asr_obj = target_outcome["asr"]
+        asr_value = asr_obj["value"]
+        asr_text = "nan" if asr_value is None else f"{asr_value:.4f}"
         print(
             f"t={t:2d}  n_labeled={labels.numel():5d}  n_targets={targets.numel():4d}  "
-            f"ASR={asr:.4f} ({ns}/{na})  F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
+            f"ASR={asr_text} ({asr_obj['success']}/{asr_obj['attempted_clean_correct']})  "
+            f"F1_pos {clean_m['f1_pos']:.3f}->{adv_m['f1_pos']:.3f}  "
             f"ROC {roc_clean if roc_clean==roc_clean else float('nan'):.3f}->{roc_adv if roc_adv==roc_adv else float('nan'):.3f}"
         )
 
@@ -751,27 +764,12 @@ def main():
         logits_clean_c = torch.cat(pooled_logits_clean)
         logits_adv_c = torch.cat(pooled_logits_adv)
         attack_mask_c = torch.cat(pooled_attack_mask)
-        surrogate_pred_clean_c = torch.cat(pooled_surrogate_pred_clean)
-        surrogate_pred_adv_c = torch.cat(pooled_surrogate_pred_adv)
-        surrogate_logits_clean_c = torch.cat(pooled_surrogate_logits_clean)
-        surrogate_logits_adv_c = torch.cat(pooled_surrogate_logits_adv)
-        surrogate_attack_mask_c = torch.cat(pooled_surrogate_attack_mask)
 
         clean_c = binary_classification_metrics(y_true, pred_clean_c)
         adv_c = binary_classification_metrics(y_true, pred_adv_c)
         full_mask = torch.ones(y_true.numel(), dtype=torch.bool)
         roc_c_clean = roc_auc_binary(logits_clean_c, y_true, full_mask)
         roc_c_adv = roc_auc_binary(logits_adv_c, y_true, full_mask)
-
-        asr_c, ns_c, na_c = attack_success_rate(y_true, pred_clean_c, pred_adv_c, attack_mask_c)
-        asr_cp, sp_c, ap_c, asr_cn, sn_c, an_c = asr_pos_neg(y_true, logits_clean_c, logits_adv_c, attack_mask_c)
-        surrogate_asr_c, surrogate_ns_c, surrogate_na_c = attack_success_rate(
-            y_true, surrogate_pred_clean_c, surrogate_pred_adv_c, surrogate_attack_mask_c
-        )
-        (
-            surrogate_asr_cp, surrogate_sp_c, surrogate_ap_c,
-            surrogate_asr_cn, surrogate_sn_c, surrogate_an_c,
-        ) = asr_pos_neg(y_true, surrogate_logits_clean_c, surrogate_logits_adv_c, surrogate_attack_mask_c)
 
         conf_drop_c, conf_drop_n_c = mean_confidence_drop(
             y_true, logits_clean_c, logits_adv_c, attack_mask_c, only_clean_correct=True
@@ -796,29 +794,39 @@ def main():
             "recall_pos_clean": clean_c["recall_pos"], "recall_pos_adv": adv_c["recall_pos"], "recall_pos_drop": recall_pos_drop_c,
             "roc_auc_clean": roc_c_clean, "roc_auc_adv": roc_c_adv,
         }
-        n_targets_available_total = int(sum(item.get("n_targets_available", 0) for item in per_slice))
-        n_targets_attacked_total = int(attack_mask_c.sum().item())
+        n_selected_targets_total = int(sum(item.get("n_targets_available", 0) for item in per_slice))
+        n_budgeted_selected_targets_total = int(
+            sum(item.get("n_budgeted_selected_targets", 0) for item in per_slice)
+        )
         n_eligible_timesteps = int(sum(1 for item in per_slice if item.get("n_targets_available", 0) > 0))
         n_budgeted_timesteps = int(sum(1 for item in per_slice if item.get("n_injected_nodes_budgeted", 0) > 0))
+        target_outcome_c = aggregate_attacked_target_outcomes(
+            attacked_target_outcomes,
+            target_unit="timestep_node",
+        )
+        coverage_c = coverage_metrics(
+            n_selected_targets=n_selected_targets_total,
+            n_budgeted_selected_targets=n_budgeted_selected_targets_total,
+            n_attacked_targets=int(target_outcome_c["n_attacked_targets"]),
+            target_unit="timestep_node",
+        )
+        budget_efficiency_c = budget_efficiency_metrics(
+            n_attacked_targets=int(target_outcome_c["n_attacked_targets"]),
+            n_success=int(target_outcome_c["asr"]["success"]),
+            n_injected_nodes=total_injected_nodes,
+            n_logical_injected_edges=total_edges_added,
+        )
         concat_attack = {
-            "n_targets_available_total": n_targets_available_total,
-            "n_targets_attacked_total": n_targets_attacked_total,
-            "n_targets_total": n_targets_attacked_total,
+            "target_outcome": target_outcome_c,
+            "coverage": coverage_c,
+            "budget_efficiency": budget_efficiency_c,
             "n_eligible_timesteps": n_eligible_timesteps,
             "n_budgeted_timesteps": n_budgeted_timesteps,
-            "asr": asr_c, "asr_success": ns_c, "asr_attempted": na_c,
-            "asr_pos": asr_cp, "asr_pos_success": sp_c, "asr_pos_attempted": ap_c,
-            "asr_neg": asr_cn, "asr_neg_success": sn_c, "asr_neg_attempted": an_c,
-            "surrogate_asr": surrogate_asr_c,
-            "surrogate_asr_success": surrogate_ns_c,
-            "surrogate_asr_attempted": surrogate_na_c,
-            "surrogate_asr_pos": surrogate_asr_cp,
-            "surrogate_asr_pos_success": surrogate_sp_c,
-            "surrogate_asr_pos_attempted": surrogate_ap_c,
-            "surrogate_asr_neg": surrogate_asr_cn,
-            "surrogate_asr_neg_success": surrogate_sn_c,
-            "surrogate_asr_neg_attempted": surrogate_an_c,
-            "mean_confidence_drop": conf_drop_c, "conf_drop_n": conf_drop_n_c,
+            "mean_confidence_drop": {
+                "scope": "attacked_targets",
+                "value": conf_drop_c,
+                "n_clean_correct": conf_drop_n_c,
+            },
             "perturbation_l2_on_injected_nodes": pert_l2_c,
             "perturbation_l2_n_injected_nodes": pert_l2_n_c,
             "avg_perturbation": avg_perturbation_c,
@@ -826,29 +834,21 @@ def main():
         }
 
     print()
-    # print(
-    #     f"TDGIA CoSemiGNN | n_inject={N_INJECT} degree_limit={DEGREE_LIMIT} "
-    #     f"eps_feature={EPS_FEATURE} lr={LR} steps={STEPS}"
-    # )
-    # print(f"Total injected nodes: {total_injected_nodes}, edges added: {total_edges_added}")
-    # if concat_classification is not None and concat_attack is not None:
-    #     print(f"[concatenated across timesteps, n={concat_classification['n_total']}]")
-    #     print(
-    #         f"  ASR     : {concat_attack['asr']:.4f} "
-    #         f"({concat_attack['asr_success']}/{concat_attack['asr_attempted']})"
-    #     )
-    #     print(
-    #         f"  ASR_pos : {concat_attack['asr_pos']:.4f} "
-    #         f"({concat_attack['asr_pos_success']}/{concat_attack['asr_pos_attempted']})  "
-    #         f"ASR_neg : {concat_attack['asr_neg']:.4f} "
-    #         f"({concat_attack['asr_neg_success']}/{concat_attack['asr_neg_attempted']})"
-    #     )
-    #     print(f"  F1_pos     : {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}  (drop {concat_classification['f1_pos_drop']:.4f})")
-    #     print(f"  Recall_pos : {concat_classification['recall_pos_clean']:.4f} -> {concat_classification['recall_pos_adv']:.4f}  (drop {concat_classification['recall_pos_drop']:.4f})")
-    #     print(f"  F1_macro   : {concat_classification['f1_macro_clean']:.4f} -> {concat_classification['f1_macro_adv']:.4f}")
-    #     print(f"  ROC-AUC    : {concat_classification['roc_auc_clean']:.4f} -> {concat_classification['roc_auc_adv']:.4f}")
-    #     print(f"  Mean conf drop (clean-correct): {concat_attack['mean_confidence_drop']:.4f} over n={concat_attack['conf_drop_n']}")
-    # print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
+    print(f"TDGIA CoSemiGNN | total injected nodes={total_injected_nodes}, edges={total_edges_added}")
+    if concat_classification is not None and concat_attack is not None:
+        asr_obj = concat_attack["target_outcome"]["asr"]
+        asr_value = asr_obj["value"]
+        asr_text = "nan" if asr_value is None else f"{asr_value:.4f}"
+        coverage_value = concat_attack["coverage"]["attacked_target_coverage"]
+        coverage_text = "nan" if coverage_value is None else f"{coverage_value:.4f}"
+        print(f"[concatenated across timesteps, n={concat_classification['n_total']}]")
+        print(
+            f"  Attacked-target ASR: {asr_text} "
+            f"({asr_obj['success']}/{asr_obj['attempted_clean_correct']})"
+        )
+        print(f"  Attacked-target coverage: {coverage_text}")
+        print(f"  F1_pos: {concat_classification['f1_pos_clean']:.4f} -> {concat_classification['f1_pos_adv']:.4f}")
+    print(f"Attack time (total over test timesteps): {attack_time_seconds:.4f} s")
 
     run_dir, ts = make_run_dir(MODEL_NAME, SURROGATE_MODEL_NAME)
     config = {
@@ -888,6 +888,7 @@ def main():
             ),
             "crafting_model": "surrogate_model",
             "evaluation_model": "victim_model",
+            "attack_label_source": "true_target_labels",
         },
         "timesteps": {"predict_start": predict_start, "predict_end": predict_end},
         "target_selection": {
@@ -903,8 +904,20 @@ def main():
         "surrogate_model_hparams": surrogate_model_cfg,
         "semi_cache_dir": semi_cache_dir,
         "injection_schedule": {
+            "strategy": "top_tdgia_defective_score",
             "eligible_timesteps": eligible_timesteps,
             "sampled_timesteps": sampled_injection_timesteps,
+            "selected_timesteps": sampled_injection_timesteps,
+            "timestep_defective_scores": [
+                {
+                    "t": int(t),
+                    "top_slot_score": float(timestep_slot_scores.get(int(t), [0.0])[0])
+                    if timestep_slot_scores.get(int(t), [])
+                    else 0.0,
+                    "slot_scores": [float(s) for s in timestep_slot_scores.get(int(t), [])],
+                }
+                for t in sorted(timestep_slot_scores)
+            ],
             "allocation_by_timestep": [
                 {"t": int(t), "n_inject": int(injection_allocation[t])}
                 for t in sorted(injection_allocation)
@@ -924,17 +937,48 @@ def main():
         },
         "attack_effect": {
             "attack_time_seconds": attack_time_seconds,
-            "aggregate_concat": concat_attack,
+            "target_outcome": concat_attack["target_outcome"] if concat_attack else None,
+            "coverage": concat_attack["coverage"] if concat_attack else None,
+            "budget_efficiency": concat_attack["budget_efficiency"] if concat_attack else None,
+            "timesteps": {
+                "n_eligible_timesteps": concat_attack["n_eligible_timesteps"] if concat_attack else 0,
+                "n_budgeted_timesteps": concat_attack["n_budgeted_timesteps"] if concat_attack else 0,
+            },
+            "mean_confidence_drop": concat_attack["mean_confidence_drop"] if concat_attack else None,
+            "perturbation": {
+                "l2_on_injected_nodes": concat_attack["perturbation_l2_on_injected_nodes"] if concat_attack else 0.0,
+                "n_injected_nodes": concat_attack["perturbation_l2_n_injected_nodes"] if concat_attack else 0,
+                "avg_abs": concat_attack["avg_perturbation"] if concat_attack else 0.0,
+                "avg_signed": concat_attack["avg_perturbation_signed"] if concat_attack else 0.0,
+            },
         },
         "injection": {
             "total_injected_nodes": total_injected_nodes,
             "total_edges_added": total_edges_added,
+            "total_logical_injected_edges": total_edges_added,
             "budget_mode": "global_sequence",
+            "schedule_strategy": "top_tdgia_defective_score",
             "n_inject_total_budget": int(N_INJECT),
-            "n_targets_available_total": int(sum(item.get("n_targets_available", 0) for item in per_slice)),
-            "n_targets_attacked_total": int(sum(item.get("n_targets_attacked", 0) for item in per_slice)),
+            "n_selected_targets_total": int(sum(item.get("n_targets_available", 0) for item in per_slice)),
+            "n_budgeted_selected_targets_total": int(sum(item.get("n_budgeted_selected_targets", 0) for item in per_slice)),
+            "n_attacked_targets_total": (
+                int(concat_attack["target_outcome"]["n_attacked_targets"])
+                if concat_attack
+                else 0
+            ),
             "eligible_timesteps": eligible_timesteps,
             "sampled_timesteps": sampled_injection_timesteps,
+            "selected_timesteps": sampled_injection_timesteps,
+            "timestep_defective_scores": [
+                {
+                    "t": int(t),
+                    "top_slot_score": float(timestep_slot_scores.get(int(t), [0.0])[0])
+                    if timestep_slot_scores.get(int(t), [])
+                    else 0.0,
+                    "slot_scores": [float(s) for s in timestep_slot_scores.get(int(t), [])],
+                }
+                for t in sorted(timestep_slot_scores)
+            ],
             "allocation_by_timestep": [
                 {"t": int(t), "n_inject": int(injection_allocation[t])}
                 for t in sorted(injection_allocation)
