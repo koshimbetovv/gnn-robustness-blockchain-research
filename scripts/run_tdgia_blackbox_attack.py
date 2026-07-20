@@ -30,7 +30,7 @@ from src.utils.tdgia_metrics import (
 # The victim is never used while crafting the injection. TDGIA is crafted on
 # SURROGATE_MODEL_NAME and then transferred to MODEL_NAME, matching the original
 # paper's black-box GIA setup.
-MODEL_NAME = "gcn"          # victim: "gcn", "graphsage", "gat", "chronowave_gnn"
+MODEL_NAME = "graphsage"          # victim: "gcn", "graphsage", "gat", "chronowave_gnn"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None
 
@@ -46,8 +46,8 @@ SPLIT = "test"
 
 # ---------- TDGIA hyperparameters ----------
 EPS_FEATURE = 0.05     # None -> no local feature budget; else constrain injected features to base +/- eps
-N_INJECT = 10
-DEGREE_LIMIT = 40
+N_INJECT = 20
+DEGREE_LIMIT = 3
 BATCH_SIZE = 1
 STEPS = 30
 LR = 0.05

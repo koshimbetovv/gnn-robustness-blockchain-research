@@ -3,9 +3,13 @@ import sys
 import json
 import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from torch_geometric.nn import GCNConv
 
 from src.datasets.recgnn_elliptic import RecGNNEllipticConfig, RecGNNEllipticDataset
 from src.datasets.recgnn_ellipticpp_actors import (
@@ -38,9 +42,20 @@ MODEL_NAME = "recgnn"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None
 
-SURROGATE_MODEL_NAME = "recgnn"
+SURROGATE_MODEL_NAME = "temporal_gcn"
+# SURROGATE_MODEL_NAME = "recgnn"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
+
+# Train a paper-style slice GCN surrogate on RecGNN train graphs instead of
+# loading another recurrent checkpoint. Use SURROGATE_MODEL_NAME = "temporal_gcn"
+# to enable.
+TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
+TEMPORAL_GCN_DROPOUT = 0.5
+TEMPORAL_GCN_EPOCHS = 150
+TEMPORAL_GCN_LR = 0.005
+TEMPORAL_GCN_WEIGHT_DECAY = 5e-4
+TEMPORAL_GCN_LOG_EVERY = 50
 
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (93 local + 2 ANF = 95 features)
@@ -49,12 +64,12 @@ DATASET = "elliptic"
 
 # ---------- TDGIA hyperparameters ----------
 N_INJECT = 20
-DEGREE_LIMIT = 5
+DEGREE_LIMIT = 3
 BATCH_SIZE = 1
 EPS_FEATURE = 0.05
 STEPS = 30
 LR = 0.05
-SMOOTH_R = 0.5
+SMOOTH_R = 0.7
 ALPHA_MU = 0.5
 K1 = 1.0
 K2 = 1.0
@@ -153,6 +168,162 @@ def sample_injection_schedule(
     )
 
 
+class PaperStyleSliceGCN(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int = 2, hidden_dims=(256, 128, 64), dropout: float = 0.5):
+        super().__init__()
+        dims = [int(in_dim)] + [int(h) for h in hidden_dims] + [int(out_dim)]
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropout = float(dropout)
+        for i in range(len(dims) - 1):
+            self.convs.append(GCNConv(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                self.norms.append(nn.LayerNorm(dims[i + 1]))
+
+    def forward(self, x, edge_index):
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index)
+            x = self.norms[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.convs[-1](x, edge_index)
+
+
+def fit_train_graph_feature_transform(sequence, attack_dim: int, device):
+    xs = []
+    for graph in sequence.train_graphs:
+        g = graph.to(device)
+        if g.x.numel() > 0:
+            xs.append(g.x.float()[:, :int(attack_dim)].detach())
+    if not xs:
+        raise RuntimeError("Cannot fit temporal GCN surrogate transform: no non-empty train graphs.")
+    x_train = torch.cat(xs, dim=0)
+    mean = x_train.mean(dim=0).to(device)
+    scale = x_train.std(dim=0, unbiased=False).clamp_min(1e-12).to(device)
+    return mean, scale
+
+
+def apply_feature_transform(features: torch.Tensor, transform):
+    if transform is None:
+        return features
+    mean, scale = transform
+    return (features - mean.to(features.device)) / scale.to(features.device)
+
+
+class _DummyEvolveLinear:
+    def __init__(self):
+        self._row_h = None
+        self._row_c = None
+        self._current_weight = None
+
+
+class _DummyCell:
+    def __init__(self):
+        self.evolve_linear = _DummyEvolveLinear()
+
+
+class _DummyMLSTM:
+    def __init__(self, state_rows: int):
+        self.state_rows = int(state_rows)
+        self._h_state = None
+        self._c_state = None
+        self.cell = _DummyCell()
+
+
+class RecTemporalGCNSurrogate(nn.Module):
+    def __init__(self, gcn: PaperStyleSliceGCN, transform, attack_dim: int, state_rows: int):
+        super().__init__()
+        self.gcn = gcn
+        self.transform = transform
+        self.attack_dim = int(attack_dim)
+        self.m_lstm = _DummyMLSTM(state_rows)
+
+    def reset_sequence_state(self, device=None):
+        del device
+        self.m_lstm._h_state = None
+        self.m_lstm._c_state = None
+        self.m_lstm.cell.evolve_linear._row_h = None
+        self.m_lstm.cell.evolve_linear._row_c = None
+        self.m_lstm.cell.evolve_linear._current_weight = None
+
+    def detach_sequence_state(self):
+        return None
+
+    def forward(self, x, edge_index):
+        x_sur = apply_feature_transform(x[:, : self.attack_dim], self.transform)
+        logits = self.gcn(x_sur, edge_index)
+        return F.log_softmax(logits, dim=1)
+
+
+def train_temporal_gcn_surrogate(
+    sequence,
+    attack_dim: int,
+    state_rows: int,
+    device,
+    *,
+    hidden_dims,
+    dropout,
+    epochs,
+    lr,
+    weight_decay,
+    log_every,
+):
+    transform = fit_train_graph_feature_transform(sequence, attack_dim, device)
+    model = PaperStyleSliceGCN(attack_dim, 2, hidden_dims=hidden_dims, dropout=dropout).to(device)
+
+    labels_all = []
+    for graph in sequence.train_graphs:
+        g = graph.to(device)
+        if g.y is not None and g.y.numel() > 0:
+            labels_all.append(g.y[g.y != -1].detach())
+    if not labels_all:
+        raise RuntimeError("Cannot train temporal GCN surrogate: no labeled train nodes.")
+    y_all = torch.cat(labels_all).long()
+    counts = torch.bincount(y_all, minlength=2).float().to(device).clamp_min(1.0)
+    class_weight = counts.sum() / (2.0 * counts)
+
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    model.train()
+    for ep in range(int(epochs)):
+        loss_total = 0.0
+        n_terms = 0
+        for graph in sequence.train_graphs:
+            g = graph.to(device)
+            x = g.x.float()
+            y = g.y
+            mask = y != -1
+            if int(mask.sum().item()) == 0:
+                continue
+            x_sur = apply_feature_transform(x[:, :int(attack_dim)], transform)
+            logits = model(x_sur, g.edge_index.long())
+            loss = F.cross_entropy(logits[mask], y[mask].long(), weight=class_weight)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            loss_total += float(loss.item())
+            n_terms += 1
+
+        if log_every and ((ep + 1) % int(log_every) == 0 or ep == 0 or ep + 1 == int(epochs)):
+            avg = loss_total / max(n_terms, 1)
+            print(f"  [temporal_gcn_surrogate] epoch {ep + 1}/{int(epochs)} loss={avg:.4f}")
+
+    model.eval()
+    wrapper = RecTemporalGCNSurrogate(model, transform, attack_dim, state_rows).to(device)
+    wrapper.eval()
+    return wrapper, {
+        "type": "PaperStyleSliceGCN",
+        "input_dim": int(attack_dim),
+        "hidden_dims": list(hidden_dims),
+        "dropout": float(dropout),
+        "epochs": int(epochs),
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+        "feature_transform": "train_graph_standard_scaler",
+        "attack_dim": int(attack_dim),
+        "state_rows": int(state_rows),
+    }
+
+
 def eval_recgnn_transfer(victim_atk, x, edge_index, x_adv, edge_index_adv, n_existing: int, n_injected: int):
     snap_pre = victim_atk._save_state()
     with torch.no_grad():
@@ -176,13 +347,18 @@ def main():
 
     from src.utils.model_loader import resolve_checkpoint
     ckpt_path, ckpt_run_dir = resolve_checkpoint(MODEL_NAME, model_dir=MODEL_DIR, run_id=RUN_ID)
-    surrogate_ckpt_path, surrogate_ckpt_run_dir = resolve_checkpoint(
-        SURROGATE_MODEL_NAME, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID
-    )
+    train_temporal_gcn_surrogate_flag = SURROGATE_MODEL_NAME.lower() == "temporal_gcn"
+    surrogate_ckpt_path = None
+    surrogate_ckpt_cfg = {"model": {}, "data": {}}
+    if not train_temporal_gcn_surrogate_flag:
+        surrogate_ckpt_path, surrogate_ckpt_run_dir = resolve_checkpoint(
+            SURROGATE_MODEL_NAME, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID
+        )
     with open(os.path.join(ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
         ckpt_cfg = json.load(f)
-    with open(os.path.join(surrogate_ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
-        surrogate_ckpt_cfg = json.load(f)
+    if not train_temporal_gcn_surrogate_flag:
+        with open(os.path.join(surrogate_ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
+            surrogate_ckpt_cfg = json.load(f)
 
     if DATASET == "elliptic":
         data_cfg = RecGNNEllipticConfig(**ckpt_cfg["data"])
@@ -202,10 +378,26 @@ def main():
     attack_dim = default_attack_dim if ATTACK_DIM is None else int(ATTACK_DIM)
 
     model = load_model(MODEL_NAME, sequence.num_features, 2, device=device, model_dir=MODEL_DIR, run_id=RUN_ID)
-    surrogate_model = load_model(
-        SURROGATE_MODEL_NAME, sequence.num_features, 2,
-        device=device, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID,
-    )
+    if train_temporal_gcn_surrogate_flag:
+        print("Training temporal paper-style GCN surrogate on RecGNN train graphs ...")
+        surrogate_model, surrogate_model_cfg = train_temporal_gcn_surrogate(
+            sequence,
+            attack_dim,
+            int(model.m_lstm.state_rows),
+            device,
+            hidden_dims=TEMPORAL_GCN_HIDDEN_DIMS,
+            dropout=TEMPORAL_GCN_DROPOUT,
+            epochs=TEMPORAL_GCN_EPOCHS,
+            lr=TEMPORAL_GCN_LR,
+            weight_decay=TEMPORAL_GCN_WEIGHT_DECAY,
+            log_every=TEMPORAL_GCN_LOG_EVERY,
+        )
+    else:
+        surrogate_model = load_model(
+            SURROGATE_MODEL_NAME, sequence.num_features, 2,
+            device=device, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID,
+        )
+        surrogate_model_cfg = surrogate_ckpt_cfg["model"]
     print(
         f"Train graphs: {len(sequence.train_graphs)} | Test graphs: {len(sequence.test_graphs)} | "
         f"num_features={sequence.num_features} | attack_dim={attack_dim}"
@@ -600,7 +792,7 @@ def main():
             "access": "black_box_transfer",
             "attack_stage": "evasion",
             "victim_access_during_attack": "none" if TARGET_SELECTION_MODEL == "surrogate" else "target_selection_only",
-            "surrogate": "separate_temporal_model",
+            "surrogate": "trained_temporal_gcn" if train_temporal_gcn_surrogate_flag else "separate_temporal_model",
         },
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
@@ -621,6 +813,11 @@ def main():
             "budget_mode": "global_sequence",
             "persistence": "non_persistent",
             "feature_bounds": "manual_clamp" if CLAMP is not None else "per_feature_data_minmax",
+            "static_surrogate_feature_transform": (
+                "train_graph_standard_scaler"
+                if train_temporal_gcn_surrogate_flag
+                else "none"
+            ),
             "crafting_model": "surrogate_model",
             "evaluation_model": "victim_model",
             "attack_label_source": "true_target_labels",
@@ -635,7 +832,7 @@ def main():
         "data": ckpt_cfg["data"],
         "model_hparams": ckpt_cfg["model"],
         "surrogate_data": surrogate_ckpt_cfg["data"],
-        "surrogate_model_hparams": surrogate_ckpt_cfg["model"],
+        "surrogate_model_hparams": surrogate_model_cfg,
         "injection_schedule": {
             "strategy": "top_tdgia_defective_score",
             "eligible_timesteps": eligible_timesteps,

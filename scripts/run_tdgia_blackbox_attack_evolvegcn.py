@@ -3,9 +3,13 @@ import sys
 import json
 import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from torch_geometric.nn import GCNConv
 
 from scripts.training.train_evolvegcn_utils import build_evolvegcn_model, move_sample
 from src.datasets.evolvegcn_elliptic import EvolveGCNEllipticConfig, EvolveGCNEllipticDataset
@@ -39,9 +43,20 @@ MODEL_NAME = "evolvegcn_o"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None  # e.g. "seed43_20260331_133701" for a specific checkpoint; None picks latest
 
-SURROGATE_MODEL_NAME = "evolvegcn_o"
+SURROGATE_MODEL_NAME = "temporal_gcn"
+#SURROGATE_MODEL_NAME = "evolvegcn_o"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
+
+# Train a paper-style slice GCN surrogate on EvolveGCN train windows instead of
+# loading another temporal checkpoint. Use SURROGATE_MODEL_NAME = "temporal_gcn"
+# to enable.
+TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
+TEMPORAL_GCN_DROPOUT = 0.5
+TEMPORAL_GCN_EPOCHS = 50
+TEMPORAL_GCN_LR = 0.005
+TEMPORAL_GCN_WEIGHT_DECAY = 5e-4
+TEMPORAL_GCN_LOG_EVERY = 50
 
 # Must match the dataset the checkpoint was trained on. Options:
 #   "elliptic"           -> Elliptic (166 features incl. time_step at col 0)
@@ -50,12 +65,12 @@ DATASET = "elliptic"
 
 # ---------- TDGIA hyperparameters ----------
 N_INJECT = 20
-DEGREE_LIMIT = 5
+DEGREE_LIMIT = 3
 BATCH_SIZE = 1
 EPS_FEATURE = 0.05
 STEPS = 30
 LR = 0.05
-SMOOTH_R = 0.5
+SMOOTH_R = 0.7
 ALPHA_MU = 0.5
 K1 = 1.0
 K2 = 1.0
@@ -143,18 +158,157 @@ def sample_injection_schedule(
     return score_based_injection_schedule(eligible_timesteps, timestep_slot_scores, n_inject)
 
 
+class PaperStyleSliceGCN(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int = 2, hidden_dims=(256, 128, 64), dropout: float = 0.5):
+        super().__init__()
+        dims = [int(in_dim)] + [int(h) for h in hidden_dims] + [int(out_dim)]
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.dropout = float(dropout)
+        for i in range(len(dims) - 1):
+            self.convs.append(GCNConv(dims[i], dims[i + 1], add_self_loops=False, normalize=False))
+            if i < len(dims) - 2:
+                self.norms.append(nn.LayerNorm(dims[i + 1]))
+
+    @staticmethod
+    def _edge_index_and_weight(adj):
+        if adj.is_sparse:
+            adj = adj.coalesce()
+            return adj.indices().long(), adj.values().float()
+        return adj.long(), None
+
+    def forward(self, x, adj):
+        edge_index, edge_weight = self._edge_index_and_weight(adj)
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(x, edge_index, edge_weight=edge_weight)
+            x = self.norms[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.convs[-1](x, edge_index, edge_weight=edge_weight)
+
+
+def fit_train_window_feature_transform(sequence, attack_start_col: int, device):
+    xs = []
+    for sample in sequence.train_samples:
+        _hist_adj_list, hist_ndFeats_list, _node_mask_list, _label_idx, _label_vals = move_sample(sample, device)
+        if hist_ndFeats_list and hist_ndFeats_list[-1].numel() > 0:
+            xs.append(hist_ndFeats_list[-1][:, int(attack_start_col):].detach())
+    if not xs:
+        raise RuntimeError("Cannot fit temporal GCN surrogate transform: no non-empty train windows.")
+    x_train = torch.cat(xs, dim=0)
+    mean = x_train.mean(dim=0).to(device)
+    scale = x_train.std(dim=0, unbiased=False).clamp_min(1e-12).to(device)
+    return mean, scale
+
+
+def apply_feature_transform(features: torch.Tensor, transform):
+    if transform is None:
+        return features
+    mean, scale = transform
+    return (features - mean.to(features.device)) / scale.to(features.device)
+
+
+class EvolveTemporalGCNSurrogate(nn.Module):
+    def __init__(self, gcn: PaperStyleSliceGCN, transform, attack_start_col: int):
+        super().__init__()
+        self.gcn = gcn
+        self.transform = transform
+        self.attack_start_col = int(attack_start_col)
+
+    def forward(self, hist_adj_list, hist_ndFeats_list, node_mask_list, node_indices):
+        del node_mask_list
+        x = hist_ndFeats_list[-1][:, self.attack_start_col:]
+        x = apply_feature_transform(x, self.transform)
+        logits = self.gcn(x, hist_adj_list[-1])
+        return logits[node_indices.long()]
+
+
+def train_temporal_gcn_surrogate(
+    sequence,
+    attack_start_col: int,
+    device,
+    *,
+    hidden_dims,
+    dropout,
+    epochs,
+    lr,
+    weight_decay,
+    log_every,
+):
+    transform = fit_train_window_feature_transform(sequence, attack_start_col, device)
+    in_dim = int(sequence.num_features) - int(attack_start_col)
+    model = PaperStyleSliceGCN(in_dim, 2, hidden_dims=hidden_dims, dropout=dropout).to(device)
+
+    labels_all = []
+    for sample in sequence.train_samples:
+        _hist_adj_list, _hist_ndFeats_list, _node_mask_list, _label_idx, label_vals = move_sample(sample, device)
+        if label_vals is not None and label_vals.numel() > 0:
+            labels_all.append(label_vals[label_vals != -1].detach())
+    if not labels_all:
+        raise RuntimeError("Cannot train temporal GCN surrogate: no labeled train nodes.")
+    y_all = torch.cat(labels_all).long()
+    counts = torch.bincount(y_all, minlength=2).float().to(device).clamp_min(1.0)
+    class_weight = counts.sum() / (2.0 * counts)
+
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    model.train()
+    for ep in range(int(epochs)):
+        loss_total = 0.0
+        n_terms = 0
+        for sample in sequence.train_samples:
+            hist_adj_list, hist_ndFeats_list, _node_mask_list, label_idx, label_vals = move_sample(sample, device)
+            if label_idx.numel() == 0 or label_vals.numel() == 0:
+                continue
+            mask = label_vals != -1
+            if int(mask.sum().item()) == 0:
+                continue
+
+            x = apply_feature_transform(hist_ndFeats_list[-1][:, int(attack_start_col):], transform)
+            logits = model(x, hist_adj_list[-1])
+            loss = F.cross_entropy(logits[label_idx[mask].long()], label_vals[mask].long(), weight=class_weight)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            loss_total += float(loss.item())
+            n_terms += 1
+
+        if log_every and ((ep + 1) % int(log_every) == 0 or ep == 0 or ep + 1 == int(epochs)):
+            avg = loss_total / max(n_terms, 1)
+            print(f"  [temporal_gcn_surrogate] epoch {ep + 1}/{int(epochs)} loss={avg:.4f}")
+
+    model.eval()
+    wrapper = EvolveTemporalGCNSurrogate(model, transform, attack_start_col).to(device)
+    wrapper.eval()
+    return wrapper, {
+        "type": "PaperStyleSliceGCN",
+        "input_dim": in_dim,
+        "hidden_dims": list(hidden_dims),
+        "dropout": float(dropout),
+        "epochs": int(epochs),
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+        "feature_transform": "train_window_standard_scaler",
+        "feature_start_col": int(attack_start_col),
+    }
+
+
 def main():
     device = get_device()
     set_seed(SEED, deterministic=True, benchmark=False)
 
     ckpt_path, ckpt_run_dir = resolve_checkpoint(MODEL_NAME, model_dir=MODEL_DIR, run_id=RUN_ID)
-    surrogate_ckpt_path, surrogate_ckpt_run_dir = resolve_checkpoint(
-        SURROGATE_MODEL_NAME, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID
-    )
+    train_temporal_gcn_surrogate_flag = SURROGATE_MODEL_NAME.lower() == "temporal_gcn"
+    surrogate_ckpt_path = None
+    surrogate_ckpt_cfg = {"model": {}, "data": {}}
+    if not train_temporal_gcn_surrogate_flag:
+        surrogate_ckpt_path, surrogate_ckpt_run_dir = resolve_checkpoint(
+            SURROGATE_MODEL_NAME, model_dir=SURROGATE_MODEL_DIR, run_id=SURROGATE_RUN_ID
+        )
     with open(os.path.join(ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
         ckpt_cfg = json.load(f)
-    with open(os.path.join(surrogate_ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
-        surrogate_ckpt_cfg = json.load(f)
+    if not train_temporal_gcn_surrogate_flag:
+        with open(os.path.join(surrogate_ckpt_run_dir, "config.json"), "r", encoding="utf-8") as f:
+            surrogate_ckpt_cfg = json.load(f)
 
     if DATASET == "elliptic":
         data_cfg = EvolveGCNEllipticConfig(**ckpt_cfg["data"])
@@ -177,12 +331,30 @@ def main():
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
-    surrogate_model = build_evolvegcn_model(sequence.num_features, surrogate_ckpt_cfg).to(device)
-    surrogate_state = torch.load(surrogate_ckpt_path, map_location=device)
-    surrogate_model.load_state_dict(surrogate_state)
-    surrogate_model.eval()
+    if train_temporal_gcn_surrogate_flag:
+        print("Training temporal paper-style GCN surrogate on EvolveGCN train windows ...")
+        surrogate_model, surrogate_model_cfg = train_temporal_gcn_surrogate(
+            sequence,
+            attack_start_col,
+            device,
+            hidden_dims=TEMPORAL_GCN_HIDDEN_DIMS,
+            dropout=TEMPORAL_GCN_DROPOUT,
+            epochs=TEMPORAL_GCN_EPOCHS,
+            lr=TEMPORAL_GCN_LR,
+            weight_decay=TEMPORAL_GCN_WEIGHT_DECAY,
+            log_every=TEMPORAL_GCN_LOG_EVERY,
+        )
+    else:
+        surrogate_model = build_evolvegcn_model(sequence.num_features, surrogate_ckpt_cfg).to(device)
+        surrogate_state = torch.load(surrogate_ckpt_path, map_location=device)
+        surrogate_model.load_state_dict(surrogate_state)
+        surrogate_model.eval()
+        surrogate_model_cfg = surrogate_ckpt_cfg["model"]
     print(f"✓ Loaded {MODEL_NAME.upper()} from {ckpt_path}")
-    print(f"✓ Loaded surrogate {SURROGATE_MODEL_NAME.upper()} from {surrogate_ckpt_path}")
+    if train_temporal_gcn_surrogate_flag:
+        print("✓ Trained surrogate TEMPORAL_GCN")
+    else:
+        print(f"✓ Loaded surrogate {SURROGATE_MODEL_NAME.upper()} from {surrogate_ckpt_path}")
     print(
         f"Test windows: {len(sequence.test_samples)} | num_nodes={sequence.num_nodes} | "
         f"num_features={sequence.num_features} | attack_start_col={attack_start_col}"
@@ -537,7 +709,7 @@ def main():
             "access": "black_box_transfer",
             "attack_stage": "evasion",
             "victim_access_during_attack": "none" if TARGET_SELECTION_MODEL == "surrogate" else "target_selection_only",
-            "surrogate": "separate_temporal_model",
+            "surrogate": "trained_temporal_gcn" if train_temporal_gcn_surrogate_flag else "separate_temporal_model",
         },
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
@@ -558,6 +730,11 @@ def main():
             "budget_mode": "global_sequence",
             "persistence": "non_persistent",
             "feature_bounds": "manual_clamp" if CLAMP is not None else "per_feature_data_minmax",
+            "static_surrogate_feature_transform": (
+                "train_window_standard_scaler"
+                if train_temporal_gcn_surrogate_flag
+                else "none"
+            ),
             "crafting_model": "surrogate_model",
             "evaluation_model": "victim_model",
             "attack_label_source": "true_target_labels",
@@ -572,7 +749,7 @@ def main():
         "data": ckpt_cfg["data"],
         "model_hparams": ckpt_cfg["model"],
         "surrogate_data": surrogate_ckpt_cfg["data"],
-        "surrogate_model_hparams": surrogate_ckpt_cfg["model"],
+        "surrogate_model_hparams": surrogate_model_cfg,
         "injection_schedule": {
             "strategy": "top_tdgia_defective_score",
             "eligible_timesteps": eligible_timesteps,

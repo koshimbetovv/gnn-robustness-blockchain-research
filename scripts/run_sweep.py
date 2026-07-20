@@ -39,10 +39,10 @@ ATTACK_TO_SCRIPTS: Dict[str, Dict[str, str]] = {
         "cosemignn": "scripts/run_adapted_nettack_attack_cosemignn_pertarget.py",
     },
     "tdgia": {
-        "static": "scripts/run_tdgia_attack.py",
-        "recgnn": "scripts/run_tdgia_attack_recgnn.py",
-        "evolvegcn_o": "scripts/run_tdgia_attack_evolvegcn.py",
-        "cosemignn": "scripts/run_tdgia_attack_cosemignn.py",
+        "static": "scripts/run_tdgia_blackbox_attack.py",
+        "recgnn": "scripts/run_tdgia_blackbox_attack_recgnn.py",
+        "evolvegcn_o": "scripts/run_tdgia_blackbox_attack_evolvegcn.py",
+        "cosemignn": "scripts/run_tdgia_blackbox_attack_cosemignn.py",
     },
     "monti": {
         "static": "scripts/run_monti_attack.py",

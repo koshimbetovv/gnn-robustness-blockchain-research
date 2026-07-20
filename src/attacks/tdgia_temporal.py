@@ -126,6 +126,33 @@ def _degree_from_sparse_adj(num_nodes: int, adj: torch.Tensor) -> torch.Tensor:
     return deg.clamp_min_(1.0)
 
 
+def _tdgia_order_and_labels(
+    log_prob_or_logits: torch.Tensor,
+    target_nodes: torch.Tensor,
+    surrogate_labels: torch.Tensor,
+    degree: torch.Tensor,
+    degree_limit: int,
+    alpha_mu: float,
+    k1: float,
+    k2: float,
+    *,
+    input_is_log_prob: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input_is_log_prob:
+        log_pv = log_prob_or_logits[target_nodes].gather(1, surrogate_labels.view(-1, 1)).view(-1)
+        pv = log_pv.exp().clamp_min(1e-12)
+    else:
+        probs = F.softmax(log_prob_or_logits[target_nodes], dim=1)
+        pv = probs.gather(1, surrogate_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
+
+    deg = degree[target_nodes].clamp_min(1.0)
+    d = float(max(int(degree_limit), 1))
+    lam = float(k1) / torch.sqrt(deg * d) + float(k2) / deg
+    mu = (float(alpha_mu) * pv + (1.0 - float(alpha_mu))) * lam
+    order = torch.argsort(mu, descending=True)
+    return target_nodes[order], surrogate_labels[order]
+
+
 def _tdgia_order(
     log_prob_or_logits: torch.Tensor,
     target_nodes: torch.Tensor,
@@ -138,18 +165,18 @@ def _tdgia_order(
     *,
     input_is_log_prob: bool = False,
 ) -> torch.Tensor:
-    if input_is_log_prob:
-        log_pv = log_prob_or_logits[target_nodes].gather(1, surrogate_labels.view(-1, 1)).view(-1)
-        pv = log_pv.exp().clamp_min(1e-12)
-    else:
-        probs = F.softmax(log_prob_or_logits[target_nodes], dim=1)
-        pv = probs.gather(1, surrogate_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
-
-    deg = degree[target_nodes].clamp_min(1.0)
-    d = float(max(int(degree_limit), 1))
-    lam = float(k1) / torch.sqrt(deg * d) + float(k2) / deg
-    mu = (float(alpha_mu) * pv + (1.0 - float(alpha_mu))) * lam
-    return target_nodes[torch.argsort(mu, descending=True)]
+    sorted_targets, _ = _tdgia_order_and_labels(
+        log_prob_or_logits,
+        target_nodes,
+        surrogate_labels,
+        degree,
+        degree_limit,
+        alpha_mu,
+        k1,
+        k2,
+        input_is_log_prob=input_is_log_prob,
+    )
+    return sorted_targets
 
 
 def _build_injection_edges(
@@ -172,6 +199,42 @@ def _build_injection_edges(
             edges.append((int(inj), dst))
             ptr += 1
     return edges
+
+
+def _edge_destination_targets_and_labels(
+    injected_edges: list[tuple[int, int]],
+    target_nodes: torch.Tensor,
+    surrogate_labels: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not injected_edges:
+        return (
+            target_nodes.new_empty((0,)),
+            surrogate_labels.new_empty((0,)),
+        )
+
+    label_by_target = {
+        int(node): int(label)
+        for node, label in zip(
+            target_nodes.detach().cpu().tolist(),
+            surrogate_labels.detach().cpu().tolist(),
+        )
+    }
+    selected_nodes: list[int] = []
+    selected_labels: list[int] = []
+    seen: set[int] = set()
+    for _, dst in injected_edges:
+        dst = int(dst)
+        if dst in seen or dst not in label_by_target:
+            continue
+        seen.add(dst)
+        selected_nodes.append(dst)
+        selected_labels.append(label_by_target[dst])
+
+    return (
+        torch.tensor(selected_nodes, dtype=torch.long, device=device),
+        torch.tensor(selected_labels, dtype=surrogate_labels.dtype, device=device),
+    )
 
 
 @dataclass
@@ -275,6 +338,11 @@ class CoSemiGNNTDGIAAttack:
         smooth_r: float,
         ca_weights: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if target_nodes.numel() == 0:
+            return self._apply_raw(
+                features, base_inj[:, : self.raw_dim], base_inj
+            ).detach()
+
         if eps_feature is None:
             opt_min, opt_max = feat_min, feat_max
         else:
@@ -351,7 +419,7 @@ class CoSemiGNNTDGIAAttack:
             with torch.no_grad():
                 logits_curr = self.forward_logits(x_curr, edge_curr, ca_weights).detach()
             degree = _degree_from_edge_index(x_curr.size(0), edge_curr)
-            sorted_targets = _tdgia_order(
+            sorted_targets, sorted_labels = _tdgia_order_and_labels(
                 logits_curr, target_nodes, surrogate_labels, degree, degree_limit,
                 alpha_mu, k1, k2,
             )
@@ -361,8 +429,11 @@ class CoSemiGNNTDGIAAttack:
             )
             edges = _build_injection_edges(inj_ids, sorted_targets, degree_limit)
             edge_adv = self._augment_edge_index(edge_curr, edges)
+            opt_targets, opt_labels = _edge_destination_targets_and_labels(
+                edges, sorted_targets, sorted_labels, self.device
+            )
             x_curr = self._optimize_batch(
-                x_curr, base_inj, edge_adv, target_nodes, surrogate_labels,
+                x_curr, base_inj, edge_adv, opt_targets, opt_labels,
                 feat_min, feat_max, eps_feature, steps, lr, smooth_r, ca_weights,
             )
             edge_curr = edge_adv
@@ -514,6 +585,11 @@ class EvolveGCNTDGIAAttack:
     ) -> torch.Tensor:
         col = self.attack_start_col
         attack_dim = int(base_last.size(1) - col)
+        if target_nodes.numel() == 0:
+            return self._expanded_features(
+                base_last, base_inj, base_inj[:, col : col + attack_dim]
+            ).detach()
+
         if eps_feature is None:
             opt_min, opt_max = feat_min, feat_max
         else:
@@ -615,7 +691,9 @@ class EvolveGCNTDGIAAttack:
             d = float(max(int(degree_limit), 1))
             lam = float(k1) / torch.sqrt(deg * d) + float(k2) / deg
             mu = (float(alpha_mu) * pv + (1.0 - float(alpha_mu))) * lam
-            sorted_targets = target_nodes[torch.argsort(mu, descending=True)]
+            order = torch.argsort(mu, descending=True)
+            sorted_targets = target_nodes[order]
+            sorted_labels = surrogate_labels[order]
 
             inj_ids = torch.arange(base_last_curr.size(0), base_last_curr.size(0) + bsz, device=self.device)
             base_inj = self._init_injected_features(
@@ -626,9 +704,12 @@ class EvolveGCNTDGIAAttack:
             mask_last_aug = self._expanded_mask(hist_mask_curr[-1], bsz)
             hist_adj_aug = list(hist_adj_curr[:-1]) + [adj_last_aug]
             hist_mask_aug = list(hist_mask_curr[:-1]) + [mask_last_aug]
+            opt_targets, opt_labels = _edge_destination_targets_and_labels(
+                edges, sorted_targets, sorted_labels, self.device
+            )
             base_last_curr = self._optimize_batch(
                 hist_adj_aug, list(hist_ndFeats_list[:-1]), hist_mask_aug, base_last_curr,
-                base_inj, target_nodes, surrogate_labels, feat_min, feat_max,
+                base_inj, opt_targets, opt_labels, feat_min, feat_max,
                 eps_feature, steps, lr, smooth_r,
             )
             hist_adj_curr = hist_adj_aug
@@ -775,6 +856,11 @@ class RecGNNTDGIAAttack:
         lr: float,
         smooth_r: float,
     ) -> torch.Tensor:
+        if target_nodes.numel() == 0:
+            return self._apply_raw(
+                x_base, base_inj, base_inj[:, : self.attack_dim]
+            ).detach()
+
         if eps_feature is None:
             opt_min, opt_max = feat_min, feat_max
         else:
@@ -866,7 +952,7 @@ class RecGNNTDGIAAttack:
                 log_probs_curr = self._forward(x_curr, edge_curr).detach()
                 self.model.detach_sequence_state()
             degree = _degree_from_edge_index(x_curr.size(0), edge_curr)
-            sorted_targets = _tdgia_order(
+            sorted_targets, sorted_labels = _tdgia_order_and_labels(
                 log_probs_curr, target_nodes, surrogate_labels, degree, degree_limit,
                 alpha_mu, k1, k2, input_is_log_prob=True,
             )
@@ -878,8 +964,11 @@ class RecGNNTDGIAAttack:
                 edge_adv = torch.cat([edge_curr, add_ei], dim=1)
             else:
                 edge_adv = edge_curr.clone()
+            opt_targets, opt_labels = _edge_destination_targets_and_labels(
+                edges, sorted_targets, sorted_labels, self.device
+            )
             x_curr = self._optimize_batch(
-                x_curr, base_inj, edge_adv, target_nodes, surrogate_labels,
+                x_curr, base_inj, edge_adv, opt_targets, opt_labels,
                 snap_pre, n_existing, len(all_ids) + bsz,
                 feat_min, feat_max, eps_feature, steps, lr, smooth_r,
             )

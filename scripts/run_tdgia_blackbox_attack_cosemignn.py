@@ -47,8 +47,8 @@ MODEL_NAME = "cosemignn"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None
 
-#SURROGATE_MODEL_NAME = "temporal_gcn"
-SURROGATE_MODEL_NAME = "cosemignn"
+SURROGATE_MODEL_NAME = "temporal_gcn"
+#SURROGATE_MODEL_NAME = "cosemignn"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
 
@@ -56,7 +56,7 @@ SURROGATE_RUN_ID = None
 # static checkpoint. Use SURROGATE_MODEL_NAME = "temporal_gcn" to enable.
 TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
 TEMPORAL_GCN_DROPOUT = 0.5
-TEMPORAL_GCN_EPOCHS = 300
+TEMPORAL_GCN_EPOCHS = 150
 TEMPORAL_GCN_LR = 0.005
 TEMPORAL_GCN_WEIGHT_DECAY = 5e-4
 TEMPORAL_GCN_LOG_EVERY = 50
@@ -67,10 +67,10 @@ TEMPORAL_GCN_LOG_EVERY = 50
 DATASET = "elliptic"
 
 # ---------- TDGIA hyperparameters ----------
-N_INJECT = 10
-DEGREE_LIMIT = 5
+N_INJECT = 20
+DEGREE_LIMIT = 3
 BATCH_SIZE = 1
-EPS_FEATURE = 0.05
+EPS_FEATURE = 0.2
 STEPS = 30
 LR = 0.05
 SMOOTH_R = 0.7
@@ -92,8 +92,8 @@ SEED = 0
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    #if torch.backends.mps.is_available():
+    #    return torch.device("mps")
     return torch.device("cpu")
 
 

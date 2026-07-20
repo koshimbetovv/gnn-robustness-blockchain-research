@@ -151,6 +151,41 @@ class TDGIAAttack(BaseAttack):
                 ptr += 1
         return edges
 
+    def _edge_destination_targets_and_labels(
+        self,
+        injected_edges: list[tuple[int, int]],
+        target_nodes: torch.Tensor,
+        surrogate_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not injected_edges:
+            return (
+                target_nodes.new_empty((0,)),
+                surrogate_labels.new_empty((0,)),
+            )
+
+        label_by_target = {
+            int(node): int(label)
+            for node, label in zip(
+                target_nodes.detach().cpu().tolist(),
+                surrogate_labels.detach().cpu().tolist(),
+            )
+        }
+        selected_nodes: list[int] = []
+        selected_labels: list[int] = []
+        seen: set[int] = set()
+        for _, dst in injected_edges:
+            dst = int(dst)
+            if dst in seen or dst not in label_by_target:
+                continue
+            seen.add(dst)
+            selected_nodes.append(dst)
+            selected_labels.append(label_by_target[dst])
+
+        return (
+            torch.tensor(selected_nodes, dtype=torch.long, device=self.device),
+            torch.tensor(selected_labels, dtype=surrogate_labels.dtype, device=self.device),
+        )
+
     def _extend_time_step(
         self,
         time_step_curr: Optional[torch.Tensor],
@@ -220,6 +255,11 @@ class TDGIAAttack(BaseAttack):
         lr: float,
         smooth_r: float,
     ) -> torch.Tensor:
+        if target_nodes.numel() == 0:
+            return self._apply_injected_raw(
+                x_existing, base_inj[:, : self.attack_dim], base_inj
+            ).detach()
+
         if eps_feature is None:
             opt_min = feat_min
             opt_max = feat_max
@@ -385,14 +425,17 @@ class TDGIAAttack(BaseAttack):
                 [y_curr, torch.full((bseq,), -1, device=self.device, dtype=y_curr.dtype)], dim=0
             )
             time_step_adv = self._extend_time_step(time_step_curr, batch_edges, inj_ids)
+            opt_targets, opt_labels = self._edge_destination_targets_and_labels(
+                batch_edges, target_nodes, surrogate_labels
+            )
 
             x_adv = self._optimize_batch_features(
                 x_existing=x_curr,
                 base_inj=base_inj,
                 edge_index_adv=edge_index_adv,
                 time_step_adv=time_step_adv,
-                target_nodes=target_nodes,
-                surrogate_labels=surrogate_labels,
+                target_nodes=opt_targets,
+                surrogate_labels=opt_labels,
                 feat_min=feat_min,
                 feat_max=feat_max,
                 eps_feature=eps_feature,
