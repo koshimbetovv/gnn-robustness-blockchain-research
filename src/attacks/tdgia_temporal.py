@@ -530,8 +530,7 @@ class EvolveGCNTDGIAAttack:
 
         if injected_edges:
             ei = torch.tensor(injected_edges, dtype=torch.long, device=A_norm.device).t().contiguous()
-            ei_rev = torch.stack([ei[1], ei[0]], dim=0)
-            new_idx = torch.cat([base_idx, ei, ei_rev], dim=1)
+            new_idx = torch.cat([base_idx, ei], dim=1)
         else:
             new_idx = base_idx
 
