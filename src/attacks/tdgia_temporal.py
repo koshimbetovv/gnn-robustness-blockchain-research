@@ -313,8 +313,7 @@ class CoSemiGNNTDGIAAttack:
         if not injected_edges:
             return adj.clone()
         ei = torch.tensor(injected_edges, dtype=torch.long, device=adj.device).t().contiguous()
-        ei_rev = torch.stack([ei[1], ei[0]], dim=0)
-        return torch.cat([adj, ei, ei_rev], dim=1)
+        return torch.cat([adj, ei], dim=1)
 
     def _apply_raw(self, features: torch.Tensor, raw_inj: torch.Tensor, base_inj: torch.Tensor) -> torch.Tensor:
         if self.raw_dim == features.size(1):

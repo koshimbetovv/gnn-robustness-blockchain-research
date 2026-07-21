@@ -52,11 +52,11 @@ SURROGATE_MODEL_NAME = "temporal_gcn"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
 
-# Train a slice-wise GCN surrogate on raw CoSemi train-slice features instead
+# Train a slice-wise GCN surrogate on full CoSemi train-slice features instead
 # of loading a checkpoint. Use SURROGATE_MODEL_NAME = "temporal_gcn" to enable.
 TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
 TEMPORAL_GCN_DROPOUT = 0.5
-TEMPORAL_GCN_EPOCHS = 150
+TEMPORAL_GCN_EPOCHS = 100
 TEMPORAL_GCN_LR = 0.005
 TEMPORAL_GCN_WEIGHT_DECAY = 5e-4
 TEMPORAL_GCN_LOG_EVERY = 50
@@ -70,7 +70,7 @@ DATASET = "elliptic"
 N_INJECT = 20
 DEGREE_LIMIT = 3
 BATCH_SIZE = 1
-EPS_FEATURE = 0.2
+EPS_FEATURE = 0.05
 STEPS = 30
 LR = 0.05
 SMOOTH_R = 0.7
@@ -254,8 +254,8 @@ def load_cosemignn_from_checkpoint(path: str, cfg: dict, feature_in: int, device
     return model, model_cfg
 
 
-def make_static_surrogate_data(features, labels, adj, raw_feature_dim, feature_transform):
-    x_sur = apply_static_surrogate_feature_transform(features[:, :raw_feature_dim], feature_transform)
+def make_static_surrogate_data(features, labels, adj, feature_dim, feature_transform):
+    x_sur = apply_static_surrogate_feature_transform(features[:, :feature_dim], feature_transform)
     return SimpleNamespace(
         x=x_sur,
         y=labels,
@@ -345,11 +345,19 @@ def transfer_static_surrogate_result_to_cosemi(
     reference_nodes,
 ):
     n_existing = int(features.size(0))
-    x_adv_raw = invert_static_surrogate_feature_transform(res.x_adv, feature_transform)
+    x_adv_local = invert_static_surrogate_feature_transform(res.x_adv, feature_transform)
+    if int(x_adv_local.size(1)) == int(features.size(1)):
+        return x_adv_local.to(features.dtype)
+    if int(x_adv_local.size(1)) != int(raw_feature_dim):
+        raise ValueError(
+            "Static surrogate output width must match either the full CoSemi feature width "
+            f"({features.size(1)}) or raw feature width ({raw_feature_dim}); "
+            f"got {x_adv_local.size(1)}."
+        )
     semi_existing = features[:, raw_feature_dim:]
     n_inj = len(res.injected_node_ids)
-    raw_existing = x_adv_raw[:n_existing]
-    raw_inj = x_adv_raw[n_existing:]
+    raw_existing = x_adv_local[:n_existing]
+    raw_inj = x_adv_local[n_existing:]
     if n_inj > 0:
         semi_inj = sample_reference_semi_features(
             features,
@@ -434,11 +442,12 @@ def main():
     model, model_cfg = load_cosemignn_from_checkpoint(ckpt_path, ckpt_cfg, feature_in, device)
     train_times = [i for i in range(1, int(time_cfg["train_end"]))]
     surrogate_is_static = SURROGATE_MODEL_NAME.lower() in STATIC_MODELS or train_temporal_gcn_surrogate_flag
+    static_surrogate_input_dim = feature_in if train_temporal_gcn_surrogate_flag else raw_feature_dim
     static_surrogate_feature_transform = None
     if train_temporal_gcn_surrogate_flag:
-        print("Training temporal paper-style GCN surrogate on raw CoSemi train-slice features ...")
+        print("Training temporal paper-style GCN surrogate on full CoSemi train-slice features ...")
         surrogate_model, static_surrogate_feature_transform = train_temporal_gcn_surrogate(
-            feature_list, adj_list, label_list, train_times, raw_feature_dim, device,
+            feature_list, adj_list, label_list, train_times, feature_in, device,
             hidden_dims=TEMPORAL_GCN_HIDDEN_DIMS,
             dropout=TEMPORAL_GCN_DROPOUT,
             epochs=TEMPORAL_GCN_EPOCHS,
@@ -448,8 +457,8 @@ def main():
         )
         surrogate_model_cfg = {
             "type": "PaperStyleSliceGCN",
-            "input_dim": int(raw_feature_dim),
-            "feature_scope": "raw_features",
+            "input_dim": int(feature_in),
+            "feature_scope": "full_cosemi_features",
             "hidden_dims": list(TEMPORAL_GCN_HIDDEN_DIMS),
             "dropout": TEMPORAL_GCN_DROPOUT,
             "epochs": TEMPORAL_GCN_EPOCHS,
@@ -514,7 +523,7 @@ def main():
         with torch.no_grad():
             if TARGET_SELECTION_MODEL == "surrogate" and surrogate_is_static:
                 x_static = apply_static_surrogate_feature_transform(
-                    features[:, :raw_feature_dim], static_surrogate_feature_transform
+                    features[:, :static_surrogate_input_dim], static_surrogate_feature_transform
                 )
                 logits_clean = forward_logits(surrogate_model, x_static, adj)
             else:
@@ -606,7 +615,7 @@ def main():
         with torch.no_grad():
             if surrogate_is_static:
                 x_sur_clean = apply_static_surrogate_feature_transform(
-                    features[:, :raw_feature_dim], static_surrogate_feature_transform
+                    features[:, :static_surrogate_input_dim], static_surrogate_feature_transform
                 )
                 surrogate_logits_clean = forward_logits(surrogate_model, x_sur_clean, adj)
             else:
@@ -645,14 +654,14 @@ def main():
         t0 = time.perf_counter()
         if surrogate_is_static:
             surrogate_data = make_static_surrogate_data(
-                features, labels, adj, raw_feature_dim, static_surrogate_feature_transform
+                features, labels, adj, static_surrogate_input_dim, static_surrogate_feature_transform
             )
             static_atk = TDGIAAttack(
                 surrogate_model,
                 surrogate_data,
                 device,
                 clamp=CLAMP,
-                attack_dim=raw_feature_dim,
+                attack_dim=static_surrogate_input_dim,
             )
             res = static_atk.attack(
                 target_nodes=targets,
@@ -726,7 +735,7 @@ def main():
 
         if len(res.injected_node_ids) > 0:
             if surrogate_is_static:
-                perturbation_dim = raw_feature_dim
+                perturbation_dim = static_surrogate_input_dim
                 clean_inj = invert_static_surrogate_feature_transform(
                     res.x_injected_base[:, :perturbation_dim],
                     static_surrogate_feature_transform,
@@ -901,7 +910,7 @@ def main():
             "attack_stage": "evasion",
             "victim_access_during_attack": "none" if TARGET_SELECTION_MODEL == "surrogate" else "target_selection_only",
             "surrogate": (
-                "trained_raw_feature_temporal_gcn"
+                "trained_full_cosemi_feature_temporal_gcn"
                 if train_temporal_gcn_surrogate_flag
                 else "separate_static_checkpoint"
                 if surrogate_is_static
@@ -929,7 +938,7 @@ def main():
             "persistence": "non_persistent",
             "feature_bounds": "manual_clamp" if CLAMP is not None else "per_feature_data_minmax",
             "static_surrogate_feature_transform": (
-                "cosemi_train_slice_raw_feature_standard_scaler"
+                "cosemi_train_slice_full_feature_standard_scaler"
                 if train_temporal_gcn_surrogate_flag
                 else "elliptic_standard_scaler_from_surrogate_train_split"
                 if surrogate_is_static and static_surrogate_feature_transform is not None
