@@ -5,6 +5,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -53,7 +54,7 @@ SURROGATE_RUN_ID = None
 # to enable.
 TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
 TEMPORAL_GCN_DROPOUT = 0.5
-TEMPORAL_GCN_EPOCHS = 50
+TEMPORAL_GCN_EPOCHS = 150
 TEMPORAL_GCN_LR = 0.005
 TEMPORAL_GCN_WEIGHT_DECAY = 5e-4
 TEMPORAL_GCN_LOG_EVERY = 50
@@ -158,6 +159,220 @@ def sample_injection_schedule(
     return score_based_injection_schedule(eligible_timesteps, timestep_slot_scores, n_inject)
 
 
+@dataclass
+class CompactEvolveWindow:
+    hist_adj_list: list[torch.Tensor]
+    hist_ndFeats_list: list[torch.Tensor]
+    node_mask_list: list[torch.Tensor]
+    label_idx: torch.Tensor
+    label_vals: torch.Tensor
+    global_nodes: torch.Tensor
+
+
+@dataclass
+class FullTransferResult:
+    hist_adj_list: list[torch.Tensor]
+    hist_ndFeats_list: list[torch.Tensor]
+    node_mask_list: list[torch.Tensor]
+    label_idx: torch.Tensor
+    injected_node_ids: list[int]
+    injected_edges: list[tuple[int, int]]
+
+
+def _active_nodes_from_sparse_adj(adj: torch.Tensor) -> torch.Tensor:
+    adj = adj.coalesce()
+    idx = adj.indices().long()
+    off_diag = idx[0] != idx[1]
+    idx = idx[:, off_diag]
+    if idx.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=adj.device)
+    return torch.unique(idx.reshape(-1))
+
+
+def _normalize_unweighted_sparse(idx: torch.Tensor, num_nodes: int, device: torch.device) -> torch.Tensor:
+    idx = idx.long().to(device)
+    if idx.numel() == 0:
+        idx = torch.empty((2, 0), dtype=torch.long, device=device)
+    vals = torch.ones(idx.size(1), dtype=torch.float32, device=device)
+    sp = torch.sparse_coo_tensor(idx, vals, size=(num_nodes, num_nodes), device=device).coalesce()
+    eye_idx = torch.arange(num_nodes, dtype=torch.long, device=device)
+    eye = torch.sparse_coo_tensor(
+        torch.stack([eye_idx, eye_idx], dim=0),
+        torch.ones(num_nodes, dtype=torch.float32, device=device),
+        size=(num_nodes, num_nodes),
+        device=device,
+    )
+    sp = (sp + eye).coalesce()
+    norm_idx = sp.indices()
+    degree = torch.sparse.sum(sp, dim=1).to_dense().clamp_min(1.0)
+    di = degree[norm_idx[0]]
+    dj = degree[norm_idx[1]]
+    norm_vals = sp.values() * ((di * dj) ** -0.5)
+    return torch.sparse_coo_tensor(
+        norm_idx, norm_vals, size=(num_nodes, num_nodes), dtype=torch.float32, device=device
+    ).coalesce()
+
+
+def _compact_normalized_adj_from_full(adj: torch.Tensor, global_nodes: torch.Tensor) -> torch.Tensor:
+    adj = adj.coalesce()
+    global_nodes = global_nodes.to(adj.device).long().view(-1)
+    n_compact = int(global_nodes.numel())
+    if n_compact == 0:
+        raise ValueError("Cannot build a compact EvolveGCN surrogate graph with zero nodes.")
+
+    global_to_compact = torch.full(
+        (int(adj.size(0)),), -1, dtype=torch.long, device=adj.device
+    )
+    global_to_compact[global_nodes] = torch.arange(n_compact, dtype=torch.long, device=adj.device)
+
+    idx = adj.indices().long()
+    off_diag = idx[0] != idx[1]
+    idx = idx[:, off_diag]
+    if idx.numel() > 0:
+        src = global_to_compact[idx[0]]
+        dst = global_to_compact[idx[1]]
+        keep = (src >= 0) & (dst >= 0)
+        compact_idx = torch.stack([src[keep], dst[keep]], dim=0)
+    else:
+        compact_idx = torch.empty((2, 0), dtype=torch.long, device=adj.device)
+
+    return _normalize_unweighted_sparse(compact_idx, n_compact, adj.device)
+
+
+def _compact_global_nodes(
+    *,
+    current_time: int,
+    hist_adj_list: list[torch.Tensor],
+    hist_ndFeats_list: list[torch.Tensor],
+    label_idx: torch.Tensor,
+    attack_start_col: int,
+) -> torch.Tensor:
+    last_x = hist_ndFeats_list[-1]
+    parts = [label_idx.long().view(-1)]
+
+    active_from_edges = _active_nodes_from_sparse_adj(hist_adj_list[-1])
+    if active_from_edges.numel() > 0:
+        parts.append(active_from_edges)
+
+    # Elliptic keeps the IBM timestep metadata in column 0. This is the most
+    # reliable way to include all current-slice nodes, including isolated ones.
+    if int(attack_start_col) > 0 and last_x.size(1) > 0:
+        time_nodes = (last_x[:, 0].round().long() == int(current_time)).nonzero(as_tuple=False).view(-1)
+        if time_nodes.numel() > 0:
+            parts.append(time_nodes)
+    else:
+        # Elliptic++ actors has time-varying feature matrices with zero-filled
+        # absent actors. Include active feature rows, but avoid this path for
+        # static full-matrix Elliptic where every row is nonzero.
+        active_feature_nodes = (last_x.abs().sum(dim=1) > 0).nonzero(as_tuple=False).view(-1)
+        if active_feature_nodes.numel() > 0:
+            parts.append(active_feature_nodes)
+
+    return torch.unique(torch.cat([p.to(last_x.device) for p in parts])).long()
+
+
+def _map_global_to_compact(global_nodes: torch.Tensor, node_ids: torch.Tensor) -> torch.Tensor:
+    node_ids = node_ids.to(global_nodes.device).long().view(-1)
+    compact_idx = torch.searchsorted(global_nodes, node_ids)
+    valid = (
+        (compact_idx >= 0)
+        & (compact_idx < global_nodes.numel())
+        & (global_nodes[compact_idx.clamp_max(max(global_nodes.numel() - 1, 0))] == node_ids)
+    )
+    if not bool(valid.all().item()):
+        missing = node_ids[~valid].detach().cpu().tolist()
+        raise ValueError(f"Compact EvolveGCN surrogate is missing global node ids: {missing[:10]}")
+    return compact_idx.long()
+
+
+def make_compact_current_window(
+    *,
+    current_time: int,
+    hist_adj_list: list[torch.Tensor],
+    hist_ndFeats_list: list[torch.Tensor],
+    node_mask_list: list[torch.Tensor],
+    label_idx: torch.Tensor,
+    label_vals: torch.Tensor,
+    attack_start_col: int,
+) -> CompactEvolveWindow:
+    global_nodes = _compact_global_nodes(
+        current_time=current_time,
+        hist_adj_list=hist_adj_list,
+        hist_ndFeats_list=hist_ndFeats_list,
+        label_idx=label_idx,
+        attack_start_col=attack_start_col,
+    )
+    compact_label_idx = _map_global_to_compact(global_nodes, label_idx)
+    compact_adj = _compact_normalized_adj_from_full(hist_adj_list[-1], global_nodes)
+    compact_x = hist_ndFeats_list[-1][global_nodes]
+    compact_mask = node_mask_list[-1][global_nodes]
+    return CompactEvolveWindow(
+        hist_adj_list=[compact_adj],
+        hist_ndFeats_list=[compact_x],
+        node_mask_list=[compact_mask],
+        label_idx=compact_label_idx,
+        label_vals=label_vals,
+        global_nodes=global_nodes,
+    )
+
+
+def transfer_compact_result_to_full(
+    *,
+    compact_res,
+    compact_global_nodes: torch.Tensor,
+    full_hist_adj_list: list[torch.Tensor],
+    full_hist_ndFeats_list: list[torch.Tensor],
+    full_node_mask_list: list[torch.Tensor],
+    full_label_idx: torch.Tensor,
+) -> FullTransferResult:
+    n_full = int(full_hist_ndFeats_list[-1].size(0))
+    n_compact = int(compact_global_nodes.numel())
+    compact_injected_ids = [int(i) for i in compact_res.injected_node_ids]
+    n_inject = len(compact_injected_ids)
+
+    if n_inject > 0:
+        compact_inj_tensor = torch.tensor(
+            compact_injected_ids, dtype=torch.long, device=full_hist_ndFeats_list[-1].device
+        )
+        injected_features = compact_res.hist_ndFeats_list[-1][compact_inj_tensor]
+    else:
+        injected_features = full_hist_ndFeats_list[-1].new_empty((0, full_hist_ndFeats_list[-1].size(1)))
+
+    full_injected_ids = [n_full + i for i in range(n_inject)]
+    injected_global_by_compact = {
+        int(compact_id): int(global_id)
+        for compact_id, global_id in zip(compact_injected_ids, full_injected_ids)
+    }
+
+    def _compact_id_to_full(node_id: int) -> int:
+        node_id = int(node_id)
+        if node_id < n_compact:
+            return int(compact_global_nodes[node_id].item())
+        if node_id in injected_global_by_compact:
+            return injected_global_by_compact[node_id]
+        return n_full + (node_id - n_compact)
+
+    full_edges = [
+        (_compact_id_to_full(src), _compact_id_to_full(dst))
+        for src, dst in compact_res.injected_edges
+    ]
+
+    full_last_x = torch.cat([full_hist_ndFeats_list[-1], injected_features], dim=0)
+    full_last_adj = EvolveGCNTDGIAAttack._augment_adj(
+        full_hist_adj_list[-1], n_full, n_inject, full_edges
+    )
+    full_last_mask = EvolveGCNTDGIAAttack._expanded_mask(full_node_mask_list[-1], n_inject)
+
+    return FullTransferResult(
+        hist_adj_list=list(full_hist_adj_list[:-1]) + [full_last_adj],
+        hist_ndFeats_list=list(full_hist_ndFeats_list[:-1]) + [full_last_x],
+        node_mask_list=list(full_node_mask_list[:-1]) + [full_last_mask],
+        label_idx=full_label_idx,
+        injected_node_ids=full_injected_ids,
+        injected_edges=full_edges,
+    )
+
+
 class PaperStyleSliceGCN(nn.Module):
     def __init__(self, in_dim: int, out_dim: int = 2, hidden_dims=(256, 128, 64), dropout: float = 0.5):
         super().__init__()
@@ -187,14 +402,13 @@ class PaperStyleSliceGCN(nn.Module):
         return self.convs[-1](x, edge_index, edge_weight=edge_weight)
 
 
-def fit_train_window_feature_transform(sequence, attack_start_col: int, device):
+def fit_compact_train_window_feature_transform(compact_train_samples: list[CompactEvolveWindow], attack_start_col: int, device):
     xs = []
-    for sample in sequence.train_samples:
-        _hist_adj_list, hist_ndFeats_list, _node_mask_list, _label_idx, _label_vals = move_sample(sample, device)
-        if hist_ndFeats_list and hist_ndFeats_list[-1].numel() > 0:
-            xs.append(hist_ndFeats_list[-1][:, int(attack_start_col):].detach())
+    for sample in compact_train_samples:
+        if sample.hist_ndFeats_list[-1].numel() > 0:
+            xs.append(sample.hist_ndFeats_list[-1][:, int(attack_start_col):].detach())
     if not xs:
-        raise RuntimeError("Cannot fit temporal GCN surrogate transform: no non-empty train windows.")
+        raise RuntimeError("Cannot fit compact temporal GCN surrogate transform: no non-empty train windows.")
     x_train = torch.cat(xs, dim=0)
     mean = x_train.mean(dim=0).to(device)
     scale = x_train.std(dim=0, unbiased=False).clamp_min(1e-12).to(device)
@@ -235,13 +449,30 @@ def train_temporal_gcn_surrogate(
     weight_decay,
     log_every,
 ):
-    transform = fit_train_window_feature_transform(sequence, attack_start_col, device)
+    compact_train_samples: list[CompactEvolveWindow] = []
+    print("  [temporal_gcn_surrogate] compacting train windows to current-timestep subgraphs ...")
+    for sample in sequence.train_samples:
+        hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx, label_vals = move_sample(sample, device)
+        compact_train_samples.append(
+            make_compact_current_window(
+                current_time=int(sample.current_time),
+                hist_adj_list=hist_adj_list,
+                hist_ndFeats_list=hist_ndFeats_list,
+                node_mask_list=node_mask_list,
+                label_idx=label_idx,
+                label_vals=label_vals,
+                attack_start_col=attack_start_col,
+            )
+        )
+    transform = fit_compact_train_window_feature_transform(
+        compact_train_samples, attack_start_col, device
+    )
     in_dim = int(sequence.num_features) - int(attack_start_col)
     model = PaperStyleSliceGCN(in_dim, 2, hidden_dims=hidden_dims, dropout=dropout).to(device)
 
     labels_all = []
-    for sample in sequence.train_samples:
-        _hist_adj_list, _hist_ndFeats_list, _node_mask_list, _label_idx, label_vals = move_sample(sample, device)
+    for sample in compact_train_samples:
+        label_vals = sample.label_vals
         if label_vals is not None and label_vals.numel() > 0:
             labels_all.append(label_vals[label_vals != -1].detach())
     if not labels_all:
@@ -255,8 +486,11 @@ def train_temporal_gcn_surrogate(
     for ep in range(int(epochs)):
         loss_total = 0.0
         n_terms = 0
-        for sample in sequence.train_samples:
-            hist_adj_list, hist_ndFeats_list, _node_mask_list, label_idx, label_vals = move_sample(sample, device)
+        for sample in compact_train_samples:
+            hist_adj_list = sample.hist_adj_list
+            hist_ndFeats_list = sample.hist_ndFeats_list
+            label_idx = sample.label_idx
+            label_vals = sample.label_vals
             if label_idx.numel() == 0 or label_vals.numel() == 0:
                 continue
             mask = label_vals != -1
@@ -289,6 +523,7 @@ def train_temporal_gcn_surrogate(
         "weight_decay": float(weight_decay),
         "feature_transform": "train_window_standard_scaler",
         "feature_start_col": int(attack_start_col),
+        "graph_scope": "compact_current_timestep",
     }
 
 
@@ -326,6 +561,7 @@ def main():
         )
 
     attack_start_col = default_attack_start_col if ATTACK_START_COL is None else int(ATTACK_START_COL)
+    compact_surrogate_enabled = train_temporal_gcn_surrogate_flag
 
     model = build_evolvegcn_model(sequence.num_features, ckpt_cfg).to(device)
     state = torch.load(ckpt_path, map_location=device)
@@ -357,7 +593,8 @@ def main():
         print(f"✓ Loaded surrogate {SURROGATE_MODEL_NAME.upper()} from {surrogate_ckpt_path}")
     print(
         f"Test windows: {len(sequence.test_samples)} | num_nodes={sequence.num_nodes} | "
-        f"num_features={sequence.num_features} | attack_start_col={attack_start_col}"
+        f"num_features={sequence.num_features} | attack_start_col={attack_start_col} | "
+        f"surrogate_graph_scope={'compact_current_timestep' if compact_surrogate_enabled else 'full_evolvegcn_window'}"
     )
 
     victim_atk = EvolveGCNTDGIAAttack(
@@ -377,12 +614,33 @@ def main():
     for sample in sequence.test_samples:
         hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx, label_vals = move_sample(sample, device)
         t = int(sample.current_time)
+        compact_window = None
+        if compact_surrogate_enabled:
+            compact_window = make_compact_current_window(
+                current_time=t,
+                hist_adj_list=hist_adj_list,
+                hist_ndFeats_list=hist_ndFeats_list,
+                node_mask_list=node_mask_list,
+                label_idx=label_idx,
+                label_vals=label_vals,
+                attack_start_col=attack_start_col,
+            )
 
         if TARGET_SELECTION_MODEL not in ("surrogate", "victim"):
             raise ValueError(f"TARGET_SELECTION_MODEL must be 'surrogate' or 'victim', got {TARGET_SELECTION_MODEL!r}.")
-        preview_atk = surrogate_atk if TARGET_SELECTION_MODEL == "surrogate" else victim_atk
         with torch.no_grad():
-            logits_clean = preview_atk.forward_labels(hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx).detach()
+            if TARGET_SELECTION_MODEL == "surrogate" and compact_surrogate_enabled:
+                logits_clean = surrogate_atk.forward_labels(
+                    compact_window.hist_adj_list,
+                    compact_window.hist_ndFeats_list,
+                    compact_window.node_mask_list,
+                    compact_window.label_idx,
+                ).detach()
+            else:
+                preview_atk = surrogate_atk if TARGET_SELECTION_MODEL == "surrogate" else victim_atk
+                logits_clean = preview_atk.forward_labels(
+                    hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx
+                ).detach()
         pred_clean = logits_clean.argmax(dim=1)
 
         target_global, target_pos = pick_targets_window(
@@ -397,9 +655,15 @@ def main():
             attack_labels = label_vals[target_pos].long()
             probs = torch.softmax(logits_clean[target_pos], dim=1)
             pv = probs.gather(1, attack_labels.view(-1, 1)).view(-1).clamp_min(1e-12)
-            degree = degree_from_sparse_adj(
-                int(hist_ndFeats_list[-1].size(0)), hist_adj_list[-1]
-            )[target_global]
+            if TARGET_SELECTION_MODEL == "surrogate" and compact_surrogate_enabled:
+                target_compact = _map_global_to_compact(compact_window.global_nodes, target_global)
+                degree = degree_from_sparse_adj(
+                    int(compact_window.hist_ndFeats_list[-1].size(0)), compact_window.hist_adj_list[-1]
+                )[target_compact]
+            else:
+                degree = degree_from_sparse_adj(
+                    int(hist_ndFeats_list[-1].size(0)), hist_adj_list[-1]
+                )[target_global]
             mu = tdgia_defective_scores_from_probability(
                 pv, degree, DEGREE_LIMIT, ALPHA_MU, K1, K2
             )
@@ -437,12 +701,31 @@ def main():
         hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx, label_vals = move_sample(sample, device)
         t = int(sample.current_time)
         assigned_n_inject = int(injection_allocation.get(t, 0))
+        compact_window = None
+        if compact_surrogate_enabled:
+            compact_window = make_compact_current_window(
+                current_time=t,
+                hist_adj_list=hist_adj_list,
+                hist_ndFeats_list=hist_ndFeats_list,
+                node_mask_list=node_mask_list,
+                label_idx=label_idx,
+                label_vals=label_vals,
+                attack_start_col=attack_start_col,
+            )
 
         with torch.no_grad():
             logits_clean = victim_atk.forward_labels(hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx).detach()
-            surrogate_logits_clean = surrogate_atk.forward_labels(
-                hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx
-            ).detach()
+            if compact_surrogate_enabled:
+                surrogate_logits_clean = surrogate_atk.forward_labels(
+                    compact_window.hist_adj_list,
+                    compact_window.hist_ndFeats_list,
+                    compact_window.node_mask_list,
+                    compact_window.label_idx,
+                ).detach()
+            else:
+                surrogate_logits_clean = surrogate_atk.forward_labels(
+                    hist_adj_list, hist_ndFeats_list, node_mask_list, label_idx
+                ).detach()
         pred_clean = logits_clean.argmax(dim=1)
         surrogate_pred_clean = surrogate_logits_clean.argmax(dim=1)
 
@@ -484,29 +767,66 @@ def main():
             )
 
         t0 = time.perf_counter()
-        res = surrogate_atk.attack_window(
-            hist_adj_list, hist_ndFeats_list, node_mask_list,
-            label_idx, target_global,
-            n_inject=assigned_n_inject, degree_limit=DEGREE_LIMIT,
-            batch_size=BATCH_SIZE, steps=STEPS, lr=LR, smooth_r=SMOOTH_R,
-            alpha_mu=ALPHA_MU, k1=K1, k2=K2,
-            init=INIT, reference_nodes=init_reference, sigma_scale=SIGMA_SCALE,
-            eps_feature=EPS_FEATURE,
-            attack_labels=label_vals[target_pos].long(),
-        )
+        if compact_surrogate_enabled:
+            target_compact = _map_global_to_compact(compact_window.global_nodes, target_global)
+            init_reference_compact = _map_global_to_compact(compact_window.global_nodes, init_reference)
+            res = surrogate_atk.attack_window(
+                compact_window.hist_adj_list,
+                compact_window.hist_ndFeats_list,
+                compact_window.node_mask_list,
+                compact_window.label_idx,
+                target_compact,
+                n_inject=assigned_n_inject, degree_limit=DEGREE_LIMIT,
+                batch_size=BATCH_SIZE, steps=STEPS, lr=LR, smooth_r=SMOOTH_R,
+                alpha_mu=ALPHA_MU, k1=K1, k2=K2,
+                init=INIT, reference_nodes=init_reference_compact, sigma_scale=SIGMA_SCALE,
+                eps_feature=EPS_FEATURE,
+                attack_labels=label_vals[target_pos].long(),
+            )
+            transfer_res = transfer_compact_result_to_full(
+                compact_res=res,
+                compact_global_nodes=compact_window.global_nodes,
+                full_hist_adj_list=hist_adj_list,
+                full_hist_ndFeats_list=hist_ndFeats_list,
+                full_node_mask_list=node_mask_list,
+                full_label_idx=label_idx,
+            )
+            adv_hist_adj_list = transfer_res.hist_adj_list
+            adv_hist_ndFeats_list = transfer_res.hist_ndFeats_list
+            adv_node_mask_list = transfer_res.node_mask_list
+            adv_label_idx = transfer_res.label_idx
+            injected_node_ids = transfer_res.injected_node_ids
+            injected_edges = transfer_res.injected_edges
+        else:
+            res = surrogate_atk.attack_window(
+                hist_adj_list, hist_ndFeats_list, node_mask_list,
+                label_idx, target_global,
+                n_inject=assigned_n_inject, degree_limit=DEGREE_LIMIT,
+                batch_size=BATCH_SIZE, steps=STEPS, lr=LR, smooth_r=SMOOTH_R,
+                alpha_mu=ALPHA_MU, k1=K1, k2=K2,
+                init=INIT, reference_nodes=init_reference, sigma_scale=SIGMA_SCALE,
+                eps_feature=EPS_FEATURE,
+                attack_labels=label_vals[target_pos].long(),
+            )
+            adv_hist_adj_list = res.hist_adj_list
+            adv_hist_ndFeats_list = res.hist_ndFeats_list
+            adv_node_mask_list = res.node_mask_list
+            adv_label_idx = res.label_idx
+            injected_node_ids = res.injected_node_ids
+            injected_edges = res.injected_edges
         attack_time_seconds += float(time.perf_counter() - t0)
-        total_injected_nodes += len(res.injected_node_ids)
-        total_edges_added += len(res.injected_edges)
+        total_injected_nodes += len(injected_node_ids)
+        total_edges_added += len(injected_edges)
         with torch.no_grad():
             logits_adv = victim_atk.forward_labels(
-                res.hist_adj_list, res.hist_ndFeats_list, res.node_mask_list, res.label_idx
+                adv_hist_adj_list, adv_hist_ndFeats_list, adv_node_mask_list, adv_label_idx
             ).detach()
         surrogate_logits_adv = res.logits_adv
         pred_adv = logits_adv.argmax(dim=1)
         surrogate_pred_adv = surrogate_logits_adv.argmax(dim=1)
 
         attacked_target_global_ids = attacked_target_ids_from_edges(
-            res.injected_edges, target_global
+            injected_edges, target_global
         )
         target_pos_by_global = {
             int(g): int(p)
@@ -544,9 +864,9 @@ def main():
             label_vals, logits_clean, logits_adv, attacked_mask, only_clean_correct=True
         )
 
-        if len(res.injected_node_ids) > 0:
+        if len(injected_node_ids) > 0:
             clean_inj = res.x_injected_base[:, attack_start_col:]
-            adv_inj = res.hist_ndFeats_list[-1][res.injected_node_ids, attack_start_col:]
+            adv_inj = adv_hist_ndFeats_list[-1][injected_node_ids, attack_start_col:]
             delta_inj = (adv_inj - clean_inj).float()
             per_node_l2 = torch.linalg.vector_norm(delta_inj, ord=2, dim=1)
             pert_l2_mean = float(per_node_l2.mean().item())
@@ -571,8 +891,8 @@ def main():
             "n_budgeted_selected_targets": int(target_global.numel()),
             "n_attacked_targets": int(target_outcome["n_attacked_targets"]),
             "n_injected_nodes_budgeted": assigned_n_inject,
-            "n_injected_nodes": len(res.injected_node_ids),
-            "edges_added": len(res.injected_edges),
+            "n_injected_nodes": len(injected_node_ids),
+            "edges_added": len(injected_edges),
             "attacked_target_global_ids": attacked_target_global_ids,
             "target_outcome": target_outcome,
             "f1_pos_clean": clean_m["f1_pos"], "f1_pos_adv": adv_m["f1_pos"], "f1_pos_drop": f1_pos_drop,
@@ -710,6 +1030,7 @@ def main():
             "attack_stage": "evasion",
             "victim_access_during_attack": "none" if TARGET_SELECTION_MODEL == "surrogate" else "target_selection_only",
             "surrogate": "trained_temporal_gcn" if train_temporal_gcn_surrogate_flag else "separate_temporal_model",
+            "surrogate_graph_scope": "compact_current_timestep" if compact_surrogate_enabled else "full_evolvegcn_window",
         },
         "model_name": MODEL_NAME,
         "model_dir": MODEL_DIR,
