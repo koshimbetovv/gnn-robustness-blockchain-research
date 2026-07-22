@@ -44,8 +44,7 @@ MODEL_NAME = "evolvegcn_o"
 MODEL_DIR = "models/Elliptic"
 RUN_ID = None  # e.g. "seed43_20260331_133701" for a specific checkpoint; None picks latest
 
-SURROGATE_MODEL_NAME = "temporal_gcn"
-#SURROGATE_MODEL_NAME = "evolvegcn_o"
+SURROGATE_MODEL_NAME = "temporal_gcn"  # "evolvegcn_o"  for whitebox crafting;
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
 

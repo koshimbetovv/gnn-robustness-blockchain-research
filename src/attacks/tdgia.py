@@ -103,6 +103,14 @@ class TDGIAAttack(BaseAttack):
             raise ValueError(f"Unknown init={init!r}")
 
         base[:, : self.attack_dim] = base[:, : self.attack_dim].clamp(min=feat_min, max=feat_max)
+        if self.attack_dim < self.x.size(1):
+            suffix_ref = ref[:, self.attack_dim :]
+            sample_idx = torch.randint(
+                int(suffix_ref.size(0)),
+                (int(n_inject),),
+                device=self.device,
+            )
+            base[:, self.attack_dim :] = suffix_ref[sample_idx].to(base.dtype)
         return base.detach()
 
     def _apply_injected_raw(self, x_existing: torch.Tensor, raw_inj: torch.Tensor, base_inj: torch.Tensor) -> torch.Tensor:
@@ -134,9 +142,31 @@ class TDGIAAttack(BaseAttack):
         injected_ids: torch.Tensor,
         target_nodes_sorted: torch.Tensor,
         degree_limit: int,
+        time_step: Optional[torch.Tensor] = None,
     ) -> list[tuple[int, int]]:
         if injected_ids.numel() == 0 or target_nodes_sorted.numel() == 0 or degree_limit <= 0:
             return []
+
+        if time_step is not None:
+            target_ts = time_step[target_nodes_sorted.long()].detach().cpu().tolist()
+            targets_by_ts: dict[int, list[int]] = {}
+            seed_ts_order: list[int] = []
+            for node, ts in zip(target_nodes_sorted.detach().cpu().tolist(), target_ts):
+                ts_key = int(ts)
+                targets_by_ts.setdefault(ts_key, []).append(int(node))
+                seed_ts_order.append(ts_key)
+
+            group_ptr: dict[int, int] = {ts: 0 for ts in targets_by_ts}
+            edges: list[tuple[int, int]] = []
+            for inj_pos, inj in enumerate(injected_ids.detach().cpu().tolist()):
+                ts_key = seed_ts_order[inj_pos % len(seed_ts_order)]
+                same_ts_targets = targets_by_ts[ts_key]
+                ptr = group_ptr[ts_key]
+                for offset in range(int(degree_limit)):
+                    dst = same_ts_targets[(ptr + offset) % len(same_ts_targets)]
+                    edges.append((int(inj), int(dst)))
+                group_ptr[ts_key] = ptr + int(degree_limit)
+            return edges
 
         total_needed = int(injected_ids.numel()) * int(degree_limit)
         reps = (total_needed + int(target_nodes_sorted.numel()) - 1) // int(target_nodes_sorted.numel())
@@ -414,10 +444,13 @@ class TDGIAAttack(BaseAttack):
                 feat_min=feat_min,
                 feat_max=feat_max,
             )
-            batch_edges = self._build_injection_edges(inj_ids, sorted_targets, degree_limit)
+            batch_edges = self._build_injection_edges(
+                inj_ids, sorted_targets, degree_limit, time_step_curr
+            )
             if batch_edges:
                 add_ei = torch.tensor(batch_edges, dtype=torch.long, device=self.device).t().contiguous()
-                edge_index_adv = torch.cat([edge_index_curr, add_ei], dim=1)
+                add_ei_rev = torch.stack([add_ei[1], add_ei[0]], dim=0)
+                edge_index_adv = torch.cat([edge_index_curr, add_ei, add_ei_rev], dim=1)
             else:
                 edge_index_adv = edge_index_curr.clone()
 

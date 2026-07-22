@@ -52,8 +52,8 @@ SURROGATE_MODEL_NAME = "temporal_gcn"
 SURROGATE_MODEL_DIR = "models/Elliptic"
 SURROGATE_RUN_ID = None
 
-# Train a slice-wise GCN surrogate on full CoSemi train-slice features instead
-# of loading a checkpoint. Use SURROGATE_MODEL_NAME = "temporal_gcn" to enable.
+# Train a slice-wise GCN surrogate directly on the full CoSemi feature tensors
+# consumed by the victim. Use SURROGATE_MODEL_NAME = "temporal_gcn" to enable.
 TEMPORAL_GCN_HIDDEN_DIMS = (256, 128, 64)
 TEMPORAL_GCN_DROPOUT = 0.5
 TEMPORAL_GCN_EPOCHS = 100
@@ -70,14 +70,14 @@ DATASET = "elliptic"
 N_INJECT = 20
 DEGREE_LIMIT = 3
 BATCH_SIZE = 1
-EPS_FEATURE = 0.05
-STEPS = 30
+EPS_FEATURE = 0.1
+STEPS = 60
 LR = 0.05
 SMOOTH_R = 0.7
 ALPHA_MU = 0.5
 K1 = 1.0
 K2 = 1.0
-INIT = "randn"
+INIT = "mean"
 SIGMA_SCALE = 1.0
 CLAMP = None
 
@@ -158,22 +158,6 @@ class PaperStyleSliceGCN(nn.Module):
         return self.convs[-1](x, edge_index)
 
 
-def fit_cosemi_train_slice_feature_transform(feature_list, train_times, feature_dim, device):
-    xs = []
-    for t in train_times:
-        if t >= len(feature_list):
-            continue
-        features = feature_list[t]
-        if features is not None and features.numel() > 0:
-            xs.append(features[:, :feature_dim].detach())
-    if not xs:
-        raise RuntimeError("Cannot fit temporal GCN surrogate transform: no non-empty train slices.")
-    x_train = torch.cat(xs, dim=0)
-    mean = x_train.mean(dim=0).to(device)
-    scale = x_train.std(dim=0, unbiased=False).clamp_min(1e-12).to(device)
-    return mean, scale
-
-
 def train_temporal_gcn_surrogate(
     feature_list,
     adj_list,
@@ -189,7 +173,7 @@ def train_temporal_gcn_surrogate(
     weight_decay,
     log_every,
 ):
-    transform = fit_cosemi_train_slice_feature_transform(feature_list, train_times, feature_dim, device)
+    transform = None
     model = PaperStyleSliceGCN(feature_dim, 2, hidden_dims=hidden_dims, dropout=dropout).to(device)
 
     labels_all = []
@@ -222,7 +206,7 @@ def train_temporal_gcn_surrogate(
             if int(mask.sum().item()) == 0:
                 continue
 
-            x = apply_static_surrogate_feature_transform(features[:, :feature_dim], transform)
+            x = features[:, :feature_dim]
             logits = model(x, adj)
             loss = F.cross_entropy(logits[mask], labels[mask].long(), weight=class_weight)
             opt.zero_grad()
@@ -443,9 +427,10 @@ def main():
     train_times = [i for i in range(1, int(time_cfg["train_end"]))]
     surrogate_is_static = SURROGATE_MODEL_NAME.lower() in STATIC_MODELS or train_temporal_gcn_surrogate_flag
     static_surrogate_input_dim = feature_in if train_temporal_gcn_surrogate_flag else raw_feature_dim
+    static_surrogate_attack_dim = raw_feature_dim
     static_surrogate_feature_transform = None
     if train_temporal_gcn_surrogate_flag:
-        print("Training temporal paper-style GCN surrogate on full CoSemi train-slice features ...")
+        print("Training temporal paper-style GCN surrogate on full CoSemi features without standardization ...")
         surrogate_model, static_surrogate_feature_transform = train_temporal_gcn_surrogate(
             feature_list, adj_list, label_list, train_times, feature_in, device,
             hidden_dims=TEMPORAL_GCN_HIDDEN_DIMS,
@@ -459,6 +444,7 @@ def main():
             "type": "PaperStyleSliceGCN",
             "input_dim": int(feature_in),
             "feature_scope": "full_cosemi_features",
+            "feature_transform": "none",
             "hidden_dims": list(TEMPORAL_GCN_HIDDEN_DIMS),
             "dropout": TEMPORAL_GCN_DROPOUT,
             "epochs": TEMPORAL_GCN_EPOCHS,
@@ -661,7 +647,7 @@ def main():
                 surrogate_data,
                 device,
                 clamp=CLAMP,
-                attack_dim=static_surrogate_input_dim,
+                attack_dim=static_surrogate_attack_dim,
             )
             res = static_atk.attack(
                 target_nodes=targets,
@@ -735,7 +721,7 @@ def main():
 
         if len(res.injected_node_ids) > 0:
             if surrogate_is_static:
-                perturbation_dim = static_surrogate_input_dim
+                perturbation_dim = static_surrogate_attack_dim
                 clean_inj = invert_static_surrogate_feature_transform(
                     res.x_injected_base[:, :perturbation_dim],
                     static_surrogate_feature_transform,
@@ -938,9 +924,7 @@ def main():
             "persistence": "non_persistent",
             "feature_bounds": "manual_clamp" if CLAMP is not None else "per_feature_data_minmax",
             "static_surrogate_feature_transform": (
-                "cosemi_train_slice_full_feature_standard_scaler"
-                if train_temporal_gcn_surrogate_flag
-                else "elliptic_standard_scaler_from_surrogate_train_split"
+                "elliptic_standard_scaler_from_surrogate_train_split"
                 if surrogate_is_static and static_surrogate_feature_transform is not None
                 else "none"
             ),

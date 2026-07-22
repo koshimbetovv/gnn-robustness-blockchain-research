@@ -313,7 +313,8 @@ class CoSemiGNNTDGIAAttack:
         if not injected_edges:
             return adj.clone()
         ei = torch.tensor(injected_edges, dtype=torch.long, device=adj.device).t().contiguous()
-        return torch.cat([adj, ei], dim=1)
+        ei_rev = torch.stack([ei[1], ei[0]], dim=0)
+        return torch.cat([adj, ei, ei_rev], dim=1)
 
     def _apply_raw(self, features: torch.Tensor, raw_inj: torch.Tensor, base_inj: torch.Tensor) -> torch.Tensor:
         if self.raw_dim == features.size(1):
@@ -530,7 +531,8 @@ class EvolveGCNTDGIAAttack:
 
         if injected_edges:
             ei = torch.tensor(injected_edges, dtype=torch.long, device=A_norm.device).t().contiguous()
-            new_idx = torch.cat([base_idx, ei], dim=1)
+            ei_rev = torch.stack([ei[1], ei[0]], dim=0)
+            new_idx = torch.cat([base_idx, ei, ei_rev], dim=1)
         else:
             new_idx = base_idx
 
@@ -959,7 +961,8 @@ class RecGNNTDGIAAttack:
             edges = _build_injection_edges(inj_ids, sorted_targets, degree_limit)
             if edges:
                 add_ei = torch.tensor(edges, dtype=torch.long, device=self.device).t().contiguous()
-                edge_adv = torch.cat([edge_curr, add_ei], dim=1)
+                add_ei_rev = torch.stack([add_ei[1], add_ei[0]], dim=0)
+                edge_adv = torch.cat([edge_curr, add_ei, add_ei_rev], dim=1)
             else:
                 edge_adv = edge_curr.clone()
             opt_targets, opt_labels = _edge_destination_targets_and_labels(
